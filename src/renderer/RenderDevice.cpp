@@ -1,13 +1,12 @@
-// license:GPLv3+
+#include "stdafx.h"
 
-#include "core/stdafx.h"
-
-#ifdef _MSC_VER
-#include "dwmapi.h"
-#pragma comment(lib, "Dwmapi.lib")
-#endif
-
+#include <DxErr.h>
 #include <thread>
+
+// Undefine this if you want to debug VR mode without a VR headset
+//#define VR_PREVIEW_TEST
+
+//#include "Dwmapi.h" // use when we get rid of XP at some point, get rid of the manual dll loads in here then
 
 #ifndef DISABLE_FORCE_NVIDIA_OPTIMUS
 #include "nvapi/nvapi.h"
@@ -16,222 +15,42 @@
 #include "RenderDevice.h"
 #include "RenderCommand.h"
 #include "Shader.h"
-#include "VRDevice.h"
-#include "renderer/AreaTex.h"
-#include "renderer/SearchTex.h"
+#include "shader/AreaTex.h"
+#include "shader/SearchTex.h"
 
-#if defined(ENABLE_BGFX)
-#ifdef __STANDALONE__
-#pragma push_macro("_WIN64")
-#undef _WIN64
-#endif
-#include "bx/platform.h"
-#include "bx/string.h"
-#include "bgfx/platform.h"
-#include "bgfx/bgfx.h"
-#ifdef __STANDALONE__
-#pragma pop_macro("_WIN64")
-#endif
-
-#elif defined(ENABLE_OPENGL)
+#if defined(ENABLE_SDL) // OpenGL
 #include "typedefs3D.h"
 #include "TextureManager.h"
-#ifndef __STANDALONE__
+#include <SDL2/SDL_syswm.h>
 #include "captureExt.h"
+
+#else // DirectX 9
+#include "Material.h"
+#include "BasicShader.h"
+#include "DMDShader.h"
+#include "FBShader.h"
+#include "FlasherShader.h"
+#include "LightShader.h"
+#include "StereoShader.h"
+#include "BallShader.h"
 #endif
 
-#elif defined(ENABLE_DX9)
-#include "parts/Material.h"
-#endif
 
-#ifdef __LIBVPINBALL__
-#include "standalone/VPinballLib.h"
-#endif
-
-#ifdef __STANDALONE__
-#include <SDL3_image/SDL_image.h>
-#endif
-
-#if defined(ENABLE_BGFX)
-struct tBGFXCallback : public bgfx::CallbackI
-{
-   ~tBGFXCallback() override { }
-   void fatal(const char* _filePath, uint16_t _line, bgfx::Fatal::Enum _code, const char* _str) override
-   {
-      //bgfx::trace(_filePath, _line, "BGFX FATAL 0x%08x: %s\n", _code, _str);
-      PLOGE << _filePath << ':' << _line << "BGFX FATAL " << _code << ": " << _str;
-      if (bgfx::Fatal::DebugCheck == _code)
-         bx::debugBreak();
-      else
-         abort();
-   }
-   void traceVargs(const char* _filePath, uint16_t _line, const char* _format, va_list _argList) override
-   {
-      char temp[2048];
-      char* out = temp;
-      va_list argListCopy;
-      va_copy(argListCopy, _argList);
-      int32_t len = bx::snprintf(out, sizeof(temp), "%s (%d): ", _filePath, _line);
-      int32_t total = len + bx::vsnprintf(out + len, sizeof(temp) - len, _format, argListCopy);
-      va_end(argListCopy);
-      if ((int32_t)sizeof(temp) < total)
-      {
-         out = (char*)alloca(total + 1);
-         bx::memCopy(out, temp, len);
-         bx::vsnprintf(out + len, total - len, _format, _argList);
-      }
-      out[total] = '\0';
-      bx::debugOutput(out);
-      if (total > 0 && out[total - 1] == '\n')
-         out[total - 1] = '\0';
-      PLOGI << out;
-   }
-   void profilerBegin(const char* /*_name*/, uint32_t /*_abgr*/, const char* /*_filePath*/, uint16_t /*_line*/) override { }
-   void profilerBeginLiteral(const char* /*_name*/, uint32_t /*_abgr*/, const char* /*_filePath*/, uint16_t /*_line*/) override { }
-   void profilerEnd() override { }
-   uint32_t cacheReadSize(uint64_t /*_id*/) override { return 0; }
-   bool cacheRead(uint64_t /*_id*/, void* /*_data*/, uint32_t /*_size*/) override { return false; }
-   void cacheWrite(uint64_t /*_id*/, const void* /*_data*/, uint32_t /*_size*/) override { }
-   void screenShot(const char* _filePath, uint32_t _width, uint32_t _height, uint32_t _pitch, const void* _data, uint32_t _size, bool _yflip) override
-   {
-#ifdef __STANDALONE__
-      if (!_data || _size == 0) {
-         RenderDevice::s_screenshotCallback(false);
-         return;
-      }
-
-      SDL_Surface* pSurface = SDL_CreateSurfaceFrom(_width, _height, SDL_PIXELFORMAT_BGRA32, const_cast<void*>(_data), _pitch);
-      if (!pSurface) {
-         RenderDevice::s_screenshotCallback(false);
-         return;
-      }
-
-      if (_yflip) {
-         SDL_Surface* pFlipped = SDL_CreateSurface(_width, _height, SDL_PIXELFORMAT_BGRA32);
-         if (!pFlipped) {
-            SDL_DestroySurface(pSurface);
-            RenderDevice::s_screenshotCallback(false);
-            return;
-         }
-
-         const uint8_t* const srcPixels = static_cast<uint8_t*>(pSurface->pixels);
-               uint8_t* const dstPixels = static_cast<uint8_t*>(pFlipped->pixels);
-         for (uint32_t y = 0; y < _height; y++)
-            memcpy(dstPixels + (_height - 1 - y) * pFlipped->pitch, srcPixels + y * pSurface->pitch, _pitch);
-
-         SDL_DestroySurface(pSurface);
-         pSurface = pFlipped;
-      }
-
-      bool success = false;
-      if (extension_from_path(_filePath) == "png")
-         success = IMG_SavePNG(pSurface, _filePath);
-      else if (extension_from_path(_filePath) == "jpg" || extension_from_path(_filePath) == "jpeg")
-         success = IMG_SaveJPG(pSurface, _filePath, 75);
-
-      SDL_DestroySurface(pSurface);
-
-      RenderDevice::s_screenshotCallback(success);
-#else
-      RenderDevice::s_screenshotCallback(false);
-#endif
-   }
-   void captureBegin(uint32_t /*_width*/, uint32_t /*_height*/, uint32_t /*_pitch*/, bgfx::TextureFormat::Enum /*_format*/, bool /*_yflip*/) override { }
-   void captureEnd() override { }
-   void captureFrame(const void* /*_data*/, uint32_t /*_size*/) override { }
-} bgfxCallback;
-
-#elif defined(ENABLE_OPENGL)
+#if defined(ENABLE_SDL) // OpenGL
 GLuint RenderDevice::m_samplerStateCache[3 * 3 * 5];
-static const char* glErrorToString(const int error)
-{
-   switch (error)
-   {
-   case GL_INVALID_ENUM: return "GL_INVALID_ENUM";
-   case GL_INVALID_VALUE: return "GL_INVALID_VALUE";
-   case GL_INVALID_OPERATION: return "GL_INVALID_OPERATION";
-#ifndef __OPENGLES__
-   case GL_STACK_OVERFLOW: return "GL_STACK_OVERFLOW";
-   case GL_STACK_UNDERFLOW: return "GL_STACK_UNDERFLOW";
-#endif
-   case GL_OUT_OF_MEMORY: return "GL_OUT_OF_MEMORY";
-   case GL_INVALID_FRAMEBUFFER_OPERATION: return "GL_INVALID_FRAMEBUFFER_OPERATION";
-   default: return "unknown";
-   }
-}
-#if 0 // not used anymore
-void checkGLErrors(const char *file, const int line) {
-   GLenum err;
-   unsigned int count = 0;
-   while ((err = glGetError()) != GL_NO_ERROR) {
-      count++;
-      ReportFatalError(err, file, line);
-   }
-   /*if (count>0) {
-      exit(-1);
-   }*/
-}
+
+#else // DirectX 9
+#if _MSC_VER >= 1900
+ #pragma comment(lib, "legacy_stdio_definitions.lib") //dxerr.lib needs this
 #endif
 
-// Callback function for printing debug statements
-#if defined(_DEBUG) && !defined(__OPENGLES__)
-void APIENTRY GLDebugMessageCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* msg, const void* data)
-{
-   char* _source;
-   switch (source)
-   {
-   case GL_DEBUG_SOURCE_API: _source = (LPSTR) "API"; break;
-   case GL_DEBUG_SOURCE_WINDOW_SYSTEM: _source = (LPSTR) "WINDOW SYSTEM"; break;
-   case GL_DEBUG_SOURCE_SHADER_COMPILER: _source = (LPSTR) "SHADER COMPILER"; break;
-   case GL_DEBUG_SOURCE_THIRD_PARTY: _source = (LPSTR) "THIRD PARTY"; break;
-   case GL_DEBUG_SOURCE_APPLICATION: _source = (LPSTR) "APPLICATION"; break;
-   case GL_DEBUG_SOURCE_OTHER: _source = (LPSTR) "UNKNOWN"; break;
-   default: _source = (LPSTR) "UNHANDLED"; break;
-   }
-   char* _type;
-   switch (type)
-   {
-   case GL_DEBUG_TYPE_ERROR: _type = (LPSTR) "ERROR"; break;
-   case GL_DEBUG_TYPE_DEPRECATED_BEHAVIOR: _type = (LPSTR) "DEPRECATED BEHAVIOR"; break;
-   case GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR: _type = (LPSTR) "UNDEFINED BEHAVIOR"; break;
-   case GL_DEBUG_TYPE_PORTABILITY: _type = (LPSTR) "PORTABILITY"; break;
-   case GL_DEBUG_TYPE_PERFORMANCE: _type = (LPSTR) "PERFORMANCE"; break;
-   case GL_DEBUG_TYPE_OTHER: _type = (LPSTR) "OTHER"; break;
-   case GL_DEBUG_TYPE_MARKER: _type = (LPSTR) "MARKER"; break;
-   case GL_DEBUG_TYPE_PUSH_GROUP: _type = (LPSTR) "GL_DEBUG_TYPE_PUSH_GROUP"; break;
-   case GL_DEBUG_TYPE_POP_GROUP: _type = (LPSTR) "GL_DEBUG_TYPE_POP_GROUP"; break;
-   default: _type = (LPSTR) "UNHANDLED"; break;
-   }
-   char* _severity;
-   switch (severity)
-   {
-   case GL_DEBUG_SEVERITY_HIGH: _severity = (LPSTR) "HIGH"; break;
-   case GL_DEBUG_SEVERITY_MEDIUM: _severity = (LPSTR) "MEDIUM"; break;
-   case GL_DEBUG_SEVERITY_LOW: _severity = (LPSTR) "LOW"; break;
-   case GL_DEBUG_SEVERITY_NOTIFICATION: _severity = (LPSTR) "NOTIFICATION"; break;
-   default: _severity = (LPSTR) "UNHANDLED"; break;
-   }
-   if (severity != GL_DEBUG_SEVERITY_NOTIFICATION)
-   {
-      // FIXME this will crash if the drivers performs the call on the wrong thread (nvogl does...)
-      /* assert(false);
-      PLOGE << "OpenGL Error #" << id << ": " << _type << " of " << _severity << "severity, raised from " << _source << ": " << msg;
-      fprintf(stderr, "%d: %s of %s severity, raised from %s: %s\n", id, _type, _severity, _source, msg);
-      if (type == GL_DEBUG_TYPE_ERROR || type == GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR || severity == GL_DEBUG_SEVERITY_HIGH)
-         ShowError(msg);*/
-   }
-}
-#endif
-
-#elif defined(ENABLE_DX9)
-#include <DxErr.h>
-#pragma comment(lib, "legacy_stdio_definitions.lib") //dxerr.lib needs this
 constexpr D3DVERTEXELEMENT9 VertexTexelElement[] =
 {
    { 0, 0 * sizeof(float), D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },  // pos
    { 0, 3 * sizeof(float), D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0 },  // tex0
    D3DDECL_END()
 };
+
 constexpr D3DVERTEXELEMENT9 VertexNormalTexelElement[] =
 {
    { 0, 0 * sizeof(float), D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },  // pos
@@ -240,6 +59,54 @@ constexpr D3DVERTEXELEMENT9 VertexNormalTexelElement[] =
    D3DDECL_END()
 };
 #endif
+
+typedef HRESULT(STDAPICALLTYPE *pRGV)(LPOSVERSIONINFOEXW osi);
+static pRGV mRtlGetVersion = nullptr;
+
+bool IsWindows10_1803orAbove()
+{
+   if (mRtlGetVersion == nullptr)
+      mRtlGetVersion = (pRGV)GetProcAddress(GetModuleHandle(TEXT("ntdll")), "RtlGetVersion"); // apparently the only really reliable solution to get the OS version (as of Win10 1803)
+
+   if (mRtlGetVersion != nullptr)
+   {
+      OSVERSIONINFOEXW osInfo;
+      osInfo.dwOSVersionInfoSize = sizeof(osInfo);
+      mRtlGetVersion(&osInfo);
+
+      if (osInfo.dwMajorVersion > 10)
+         return true;
+      if (osInfo.dwMajorVersion == 10 && osInfo.dwMinorVersion > 0)
+         return true;
+      if (osInfo.dwMajorVersion == 10 && osInfo.dwMinorVersion == 0 && osInfo.dwBuildNumber >= 17134) // which is the more 'common' 1803
+         return true;
+   }
+
+   return false;
+}
+
+bool IsWindowsVistaOr7()
+{
+   OSVERSIONINFOEXW osvi = { sizeof(osvi), 0, 0, 0, 0, { 0 }, 0, 0, 0, 0, 0 };
+   const DWORDLONG dwlConditionMask = //VerSetConditionMask(
+      VerSetConditionMask(VerSetConditionMask(0, VER_MAJORVERSION, VER_EQUAL), VER_MINORVERSION, VER_EQUAL) /*,
+      VER_SERVICEPACKMAJOR, VER_GREATER_EQUAL)*/
+      ;
+   osvi.dwMajorVersion = HIBYTE(_WIN32_WINNT_VISTA);
+   osvi.dwMinorVersion = LOBYTE(_WIN32_WINNT_VISTA);
+   //osvi.wServicePackMajor = 0;
+
+   const bool vista = VerifyVersionInfoW(&osvi, VER_MAJORVERSION | VER_MINORVERSION /*| VER_SERVICEPACKMAJOR*/, dwlConditionMask) != FALSE;
+
+   OSVERSIONINFOEXW osvi2 = { sizeof(osvi), 0, 0, 0, 0, { 0 }, 0, 0, 0, 0, 0 };
+   osvi2.dwMajorVersion = HIBYTE(_WIN32_WINNT_WIN7);
+   osvi2.dwMinorVersion = LOBYTE(_WIN32_WINNT_WIN7);
+   //osvi2.wServicePackMajor = 0;
+
+   const bool win7 = VerifyVersionInfoW(&osvi2, VER_MAJORVERSION | VER_MINORVERSION /*| VER_SERVICEPACKMAJOR*/, dwlConditionMask) != FALSE;
+
+   return vista || win7;
+}
 
 static unsigned int ComputePrimitiveCount(const RenderDevice::PrimitiveTypes type, const int vertexCount)
 {
@@ -261,16 +128,31 @@ static unsigned int ComputePrimitiveCount(const RenderDevice::PrimitiveTypes typ
    }
 }
 
+#ifdef ENABLE_SDL
+static const char* glErrorToString(const int error) {
+   switch (error) {
+   case GL_INVALID_ENUM: return "GL_INVALID_ENUM";
+   case GL_INVALID_VALUE: return "GL_INVALID_VALUE";
+   case GL_INVALID_OPERATION: return "GL_INVALID_OPERATION";
+#ifndef __OPENGLES__
+   case GL_STACK_OVERFLOW: return "GL_STACK_OVERFLOW";
+   case GL_STACK_UNDERFLOW: return "GL_STACK_UNDERFLOW";
+#endif
+   case GL_OUT_OF_MEMORY: return "GL_OUT_OF_MEMORY";
+   case GL_INVALID_FRAMEBUFFER_OPERATION: return "GL_INVALID_FRAMEBUFFER_OPERATION";
+   default: return "unknown";
+   }
+}
+#endif
+
 void ReportFatalError(const HRESULT hr, const char *file, const int line)
 {
-   char msg[2176];
-   #if defined(ENABLE_BGFX)
-      sprintf_s(msg, sizeof(msg), "Fatal Error 0x%08X in %s:%d", hr, file, line);
-   #elif defined(ENABLE_OPENGL)
-      sprintf_s(msg, sizeof(msg), "Fatal Error 0x%08X %s in %s:%d", hr, glErrorToString(hr), file, line);
-   #elif defined(ENABLE_DX9)
-      sprintf_s(msg, sizeof(msg), "Fatal Error %s (0x%x: %s) at %s:%d", DXGetErrorString(hr), hr, DXGetErrorDescription(hr), file, line);
-   #endif
+   char msg[2048+128];
+#ifdef ENABLE_SDL
+   sprintf_s(msg, sizeof(msg), "GL Fatal Error 0x%0002X %s in %s:%d", hr, glErrorToString(hr), file, line);
+#else
+   sprintf_s(msg, sizeof(msg), "Fatal error %s (0x%x: %s) at %s:%d", DXGetErrorString(hr), hr, DXGetErrorDescription(hr), file, line);
+#endif
    ShowError(msg);
    assert(false);
    exit(-1);
@@ -279,27 +161,332 @@ void ReportFatalError(const HRESULT hr, const char *file, const int line)
 void ReportError(const char *errorText, const HRESULT hr, const char *file, const int line)
 {
    char msg[16384];
-   #if defined(ENABLE_BGFX)
-      sprintf_s(msg, sizeof(msg), "Error 0x%08X in %s:%d\n%s", hr, file, line, errorText);
-   #elif defined(ENABLE_OPENGL)
-      sprintf_s(msg, sizeof(msg), "Error 0x%08X %s in %s:%d\n%s", hr, glErrorToString(hr), file, line, errorText);
-   #elif defined(ENABLE_DX9)
-      sprintf_s(msg, sizeof(msg), "%s %s (0x%x: %s) at %s:%d", errorText, DXGetErrorString(hr), hr, DXGetErrorDescription(hr), file, line);
-   #endif
+#ifdef ENABLE_SDL
+   sprintf_s(msg, sizeof(msg), "GL Error 0x%0002X %s in %s:%d\n%s", hr, glErrorToString(hr), file, line, errorText);
    ShowError(msg);
+#else
+   sprintf_s(msg, sizeof(msg), "%s %s (0x%x: %s) at %s:%d", errorText, DXGetErrorString(hr), hr, DXGetErrorDescription(hr), file, line);
+   ShowError(msg);
+   exit(-1);
+#endif
+}
+
+#if 0 //def ENABLE_SDL // not used anymore
+void checkGLErrors(const char *file, const int line) {
+   GLenum err;
+   unsigned int count = 0;
+   while ((err = glGetError()) != GL_NO_ERROR) {
+      count++;
+      ReportFatalError(err, file, line);
+   }
+   /*if (count>0) {
+      exit(-1);
+   }*/
+}
+#endif
+
+// Callback function for printing debug statements
+#if defined(ENABLE_SDL) && defined(_DEBUG) && !defined(__OPENGLES__)
+void APIENTRY GLDebugMessageCallback(GLenum source, GLenum type, GLuint id,
+                                     GLenum severity, GLsizei length,
+                                     const GLchar *msg, const void *data)
+{
+   char* _source;
+   switch (source) {
+      case GL_DEBUG_SOURCE_API: _source = (LPSTR) "API"; break;
+      case GL_DEBUG_SOURCE_WINDOW_SYSTEM: _source = (LPSTR) "WINDOW SYSTEM"; break;
+      case GL_DEBUG_SOURCE_SHADER_COMPILER: _source = (LPSTR) "SHADER COMPILER"; break;
+      case GL_DEBUG_SOURCE_THIRD_PARTY: _source = (LPSTR) "THIRD PARTY"; break;
+      case GL_DEBUG_SOURCE_APPLICATION: _source = (LPSTR) "APPLICATION"; break;
+      case GL_DEBUG_SOURCE_OTHER: _source = (LPSTR) "UNKNOWN"; break;
+      default: _source = (LPSTR) "UNHANDLED"; break;
+   }
+   char* _type;
+   switch (type) {
+   case GL_DEBUG_TYPE_ERROR: _type = (LPSTR) "ERROR"; break;
+   case GL_DEBUG_TYPE_DEPRECATED_BEHAVIOR: _type = (LPSTR) "DEPRECATED BEHAVIOR"; break;
+   case GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR: _type = (LPSTR) "UNDEFINED BEHAVIOR"; break;
+   case GL_DEBUG_TYPE_PORTABILITY: _type = (LPSTR) "PORTABILITY"; break;
+   case GL_DEBUG_TYPE_PERFORMANCE: _type = (LPSTR) "PERFORMANCE"; break;
+   case GL_DEBUG_TYPE_OTHER: _type = (LPSTR) "OTHER"; break;
+   case GL_DEBUG_TYPE_MARKER: _type = (LPSTR) "MARKER"; break;
+   case GL_DEBUG_TYPE_PUSH_GROUP: _type = (LPSTR) "GL_DEBUG_TYPE_PUSH_GROUP"; break;
+   case GL_DEBUG_TYPE_POP_GROUP: _type = (LPSTR) "GL_DEBUG_TYPE_POP_GROUP"; break;
+   default: _type = (LPSTR) "UNHANDLED"; break;
+   }
+   char* _severity;
+   switch (severity) {
+      case GL_DEBUG_SEVERITY_HIGH: _severity = (LPSTR) "HIGH"; break;
+      case GL_DEBUG_SEVERITY_MEDIUM: _severity = (LPSTR) "MEDIUM"; break;
+      case GL_DEBUG_SEVERITY_LOW: _severity = (LPSTR) "LOW"; break;
+      case GL_DEBUG_SEVERITY_NOTIFICATION: _severity = (LPSTR) "NOTIFICATION"; break;
+      default: _severity = (LPSTR) "UNHANDLED"; break;
+   }
+   if (severity != GL_DEBUG_SEVERITY_NOTIFICATION)
+   {
+      // FIXME this will crash if the drivers performs the call on the wrong thread (nvogl does...)
+      /* assert(false);
+      PLOGE << "OpenGL Error #" << id << ": " << _type << " of " << _severity << "severity, raised from " << _source << ": " << msg;
+      fprintf(stderr, "%d: %s of %s severity, raised from %s: %s\n", id, _type, _severity, _source, msg);
+      if (type == GL_DEBUG_TYPE_ERROR || type == GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR || severity == GL_DEBUG_SEVERITY_HIGH)
+         ShowError(msg);*/
+   }
+}
+#endif
+
+////////////////////////////////////////////////////////////////////
+
+int getNumberOfDisplays()
+{
+#ifdef ENABLE_SDL
+   return SDL_GetNumVideoDisplays();
+#else
+   return GetSystemMetrics(SM_CMONITORS);
+#endif
+}
+
+void EnumerateDisplayModes(const int display, vector<VideoMode>& modes)
+{
+   modes.clear();
+
+   vector<DisplayConfig> displays;
+   getDisplayList(displays);
+   if (display >= (int)displays.size())
+      return;
+   const int adapter = displays[display].adapter;
+
+#ifdef ENABLE_SDL
+   const int amount = SDL_GetNumDisplayModes(adapter);
+   for (int mode = 0; mode < amount; ++mode) {
+      SDL_DisplayMode sdlMode;
+      SDL_GetDisplayMode(adapter, mode, &sdlMode);
+      VideoMode vmode = {};
+      vmode.width = sdlMode.w;
+      vmode.height = sdlMode.h;
+      switch (sdlMode.format) {
+      case SDL_PIXELFORMAT_RGB24:
+      case SDL_PIXELFORMAT_BGR24:
+      case SDL_PIXELFORMAT_RGB888:
+      case SDL_PIXELFORMAT_RGBX8888:
+      case SDL_PIXELFORMAT_BGR888:
+      case SDL_PIXELFORMAT_BGRX8888:
+      case SDL_PIXELFORMAT_ARGB8888:
+      case SDL_PIXELFORMAT_RGBA8888:
+      case SDL_PIXELFORMAT_ABGR8888:
+      case SDL_PIXELFORMAT_BGRA8888:
+         vmode.depth = 32;
+         break;
+      case SDL_PIXELFORMAT_RGB565:
+      case SDL_PIXELFORMAT_BGR565:
+      case SDL_PIXELFORMAT_ABGR1555:
+      case SDL_PIXELFORMAT_BGRA5551:
+      case SDL_PIXELFORMAT_ARGB1555:
+      case SDL_PIXELFORMAT_RGBA5551:
+         vmode.depth = 16;
+         break;
+      case SDL_PIXELFORMAT_ARGB2101010:
+         vmode.depth = 30;
+         break;
+      default:
+         vmode.depth = 0;
+      }
+      vmode.refreshrate = sdlMode.refresh_rate;
+      modes.push_back(vmode);
+   }
+#else
+   IDirect3D9 *d3d = Direct3DCreate9(D3D_SDK_VERSION);
+   if (d3d == nullptr)
+   {
+      ShowError("Could not create D3D9 object.");
+      return;
+   }
+
+   //for (int j = 0; j < 2; ++j)
+   constexpr int j = 0; // limit to 32bit only nowadays
+   {
+      const D3DFORMAT fmt = (D3DFORMAT)((j == 0) ? colorFormat::RGB8 : colorFormat::RGB5);
+      const unsigned numModes = d3d->GetAdapterModeCount(adapter, fmt);
+
+      for (unsigned i = 0; i < numModes; ++i)
+      {
+         D3DDISPLAYMODE d3dmode;
+         d3d->EnumAdapterModes(adapter, fmt, i, &d3dmode);
+
+         if (d3dmode.Width >= 640)
+         {
+            VideoMode mode;
+            mode.width = d3dmode.Width;
+            mode.height = d3dmode.Height;
+            mode.depth = (fmt == (D3DFORMAT)colorFormat::RGB5) ? 16 : 32;
+            mode.refreshrate = d3dmode.RefreshRate;
+            modes.push_back(mode);
+         }
+      }
+   }
+
+   SAFE_RELEASE(d3d);
+#endif
+}
+
+BOOL CALLBACK MonitorEnumList(__in  HMONITOR hMonitor, __in  HDC hdcMonitor, __in  LPRECT lprcMonitor, __in  LPARAM dwData)
+{
+   std::map<string,DisplayConfig>* data = reinterpret_cast<std::map<string,DisplayConfig>*>(dwData);
+   MONITORINFOEX info;
+   info.cbSize = sizeof(MONITORINFOEX);
+   GetMonitorInfo(hMonitor, &info);
+   DisplayConfig config = {};
+   config.top = info.rcMonitor.top;
+   config.left = info.rcMonitor.left;
+   config.width = info.rcMonitor.right - info.rcMonitor.left;
+   config.height = info.rcMonitor.bottom - info.rcMonitor.top;
+   config.isPrimary = (config.top == 0) && (config.left == 0);
+   config.display = (int)data->size(); // This number does neither map to the number form display settings nor something else.
+   config.adapter = -1;
+   memcpy(config.DeviceName, info.szDevice, CCHDEVICENAME); // Internal display name e.g. "\\\\.\\DISPLAY1"
+   data->insert(std::pair<string, DisplayConfig>(config.DeviceName, config));
+   return TRUE;
+}
+
+int getDisplayList(vector<DisplayConfig>& displays)
+{
+   displays.clear();
+
+#if defined(ENABLE_SDL) && defined(_WIN32)
+   // Windows and SDL order of display enumeration do not match, therefore the display identifier will not match between DX and OpenGL version
+   // SDL2 display identifier do not match the id of the native Windows settings
+   // SDL2 does not offer a way to get the adapter (i.e. Graphics Card) associated with a display (i.e. Monitor) so we use the monitor name for both
+   // Get the resolution of all enabled displays as they appear in the Windows settings UI.
+   std::map<string, DisplayConfig> displayMap;
+   EnumDisplayMonitors(nullptr, nullptr, MonitorEnumList, reinterpret_cast<LPARAM>(&displayMap));
+   for (int i = 0; i < SDL_GetNumVideoDisplays(); ++i)
+   {
+      SDL_Rect displayBounds;
+      if (SDL_GetDisplayBounds(i, &displayBounds) == 0)
+      {
+         for (std::map<string, DisplayConfig>::iterator display = displayMap.begin(); display != displayMap.end(); ++display)
+         {
+            if (display->second.left == displayBounds.x && display->second.top == displayBounds.y && display->second.width == displayBounds.w && display->second.height == displayBounds.h)
+            {
+               display->second.adapter = i;
+               strncpy_s(display->second.GPU_Name, SDL_GetDisplayName(display->second.adapter), MAX_DEVICE_IDENTIFIER_STRING - 1);
+            }
+         }
+      }
+   }
+
+   // Apply the same numbering as windows
+   int i = 0;
+   for (std::map<string, DisplayConfig>::iterator display = displayMap.begin(); display != displayMap.end(); ++display)
+   {
+      if (display->second.adapter >= 0)
+      {
+         display->second.display = i;
+         displays.push_back(display->second);
+      }
+      i++;
+   }
+#elif defined(ENABLE_SDL)
+   int i = 0;
+   for (; i < SDL_GetNumVideoDisplays(); ++i)
+   {
+      SDL_Rect displayBounds;
+      if (SDL_GetDisplayBounds(i, &displayBounds) == 0) {
+         DisplayConfig displayConf;
+         displayConf.display = i; // Window Display identifier (the number that appears in the native Windows settings)
+         displayConf.adapter = i; // SDL Display identifier. Will be used for creating the display
+         displayConf.isPrimary = (displayBounds.x == 0) && (displayBounds.y == 0);
+         displayConf.top = displayBounds.y;
+         displayConf.left = displayBounds.x;
+         displayConf.width = displayBounds.w;
+         displayConf.height = displayBounds.h;
+         const string devicename = "\\\\.\\DISPLAY"s.append(std::to_string(i));
+         strncpy_s(displayConf.DeviceName, devicename.c_str(), CCHDEVICENAME - 1);
+         strncpy_s(displayConf.GPU_Name, SDL_GetDisplayName(displayConf.display), MAX_DEVICE_IDENTIFIER_STRING - 1);
+         displays.push_back(displayConf);
+      }
+   }
+#else
+   // Get the resolution of all enabled displays as they appear in the Windows settings UI.
+   std::map<string, DisplayConfig> displayMap;
+   EnumDisplayMonitors(nullptr, nullptr, MonitorEnumList, reinterpret_cast<LPARAM>(&displayMap));
+
+   IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+   if (pD3D == nullptr)
+   {
+      ShowError("Could not create D3D9 object.");
+      return -1;
+   }
+   // Map the displays to the DX9 adapter. Otherwise this leads to an performance impact on systems with multiple GPUs
+   const int adapterCount = pD3D->GetAdapterCount();
+   for (int i = 0; i < adapterCount; ++i)
+   {
+      D3DADAPTER_IDENTIFIER9 adapter;
+      pD3D->GetAdapterIdentifier(i, 0, &adapter);
+      std::map<string, DisplayConfig>::iterator display = displayMap.find(adapter.DeviceName);
+      if (display != displayMap.end())
+      {
+         display->second.adapter = i;
+         strncpy_s(display->second.GPU_Name, adapter.Description, sizeof(display->second.GPU_Name) - 1);
+      }
+   }
+   SAFE_RELEASE(pD3D);
+   
+   // Apply the same numbering as windows
+   int i = 0;
+   for (std::map<string, DisplayConfig>::iterator display = displayMap.begin(); display != displayMap.end(); ++display)
+   {
+      if (display->second.adapter >= 0) {
+         display->second.display = i;
+         displays.push_back(display->second);
+      }
+      i++;
+   }
+#endif
+
+   return i;
+}
+
+bool getDisplaySetupByID(const int display, int &x, int &y, int &width, int &height)
+{
+   vector<DisplayConfig> displays;
+   getDisplayList(displays);
+   for (vector<DisplayConfig>::iterator displayConf = displays.begin(); displayConf != displays.end(); ++displayConf) {
+      if ((display == -1 && displayConf->isPrimary) || display == displayConf->display) {
+         x = displayConf->left;
+         y = displayConf->top;
+         width = displayConf->width;
+         height = displayConf->height;
+         return true;
+      }
+   }
+   x = 0;
+   y = 0;
+   width = GetSystemMetrics(SM_CXSCREEN);
+   height = GetSystemMetrics(SM_CYSCREEN);
+   return false;
+}
+
+int getPrimaryDisplay()
+{
+   vector<DisplayConfig> displays;
+   getDisplayList(displays);
+   for (vector<DisplayConfig>::iterator displayConf = displays.begin(); displayConf != displays.end(); ++displayConf)
+      if (displayConf->isPrimary)
+         return displayConf->adapter;
+   return 0;
 }
 
 ////////////////////////////////////////////////////////////////////
 
 RenderDeviceState::RenderDeviceState(RenderDevice* rd)
    : m_rd(rd)
-   , m_basicShaderState(new Shader::ShaderState(m_rd->m_basicShader, m_rd->UseLowPrecision()))
-   , m_DMDShaderState(new Shader::ShaderState(m_rd->m_DMDShader, m_rd->UseLowPrecision()))
-   , m_FBShaderState(new Shader::ShaderState(m_rd->m_FBShader, m_rd->UseLowPrecision()))
-   , m_flasherShaderState(new Shader::ShaderState(m_rd->m_flasherShader, m_rd->UseLowPrecision()))
-   , m_lightShaderState(new Shader::ShaderState(m_rd->m_lightShader, m_rd->UseLowPrecision()))
-   , m_ballShaderState(new Shader::ShaderState(m_rd->m_ballShader, m_rd->UseLowPrecision()))
-   , m_stereoShaderState(new Shader::ShaderState(m_rd->m_stereoShader, m_rd->UseLowPrecision()))
+   , m_basicShaderState(new Shader::ShaderState(m_rd->basicShader))
+   , m_DMDShaderState(new Shader::ShaderState(m_rd->DMDShader))
+   , m_FBShaderState(new Shader::ShaderState(m_rd->FBShader))
+   , m_flasherShaderState(new Shader::ShaderState(m_rd->flasherShader))
+   , m_lightShaderState(new Shader::ShaderState(m_rd->lightShader))
+   , m_ballShaderState(new Shader::ShaderState(m_rd->m_ballShader))
+   , m_stereoShaderState(new Shader::ShaderState(m_rd->StereoShader))
 {
 }
 
@@ -316,614 +503,194 @@ RenderDeviceState::~RenderDeviceState()
 
 ////////////////////////////////////////////////////////////////////
 
-// MSVC Concurrency Viewer support
-// This requires to add the MSVC Concurrency SDK to the project
-//#define MSVC_CONCURRENCY_VIEWER
-#ifdef MSVC_CONCURRENCY_VIEWER
-#include <cvmarkersobj.h>
-using namespace Concurrency::diagnostic;
-marker_series series;
+#ifndef ENABLE_SDL
+typedef HRESULT(WINAPI *pD3DC9Ex)(UINT SDKVersion, IDirect3D9Ex**);
+static pD3DC9Ex mDirect3DCreate9Ex = nullptr;
 #endif
 
-#if defined(ENABLE_BGFX)
-volatile bool RenderDevice::s_screenshot = false;
-std::function<void(bool)> RenderDevice::s_screenshotCallback = [](bool) {};
-string RenderDevice::s_screenshotFilename = string();
+#define DWM_EC_DISABLECOMPOSITION         0
+#define DWM_EC_ENABLECOMPOSITION          1
+typedef HRESULT(STDAPICALLTYPE *pDICE)(BOOL* pfEnabled);
+static pDICE mDwmIsCompositionEnabled = nullptr;
+typedef HRESULT(STDAPICALLTYPE *pDF)();
+static pDF mDwmFlush = nullptr;
+typedef HRESULT(STDAPICALLTYPE *pDEC)(UINT uCompositionAction);
+static pDEC mDwmEnableComposition = nullptr;
 
-void RenderDevice::RenderThread(RenderDevice* rd, const bgfx::Init& initReq)
+RenderDevice::RenderDevice(const HWND hwnd, const int width, const int height, const bool fullscreen, const int colordepth, const float AAfactor, const StereoMode stereo3D, const unsigned int FXAA, const bool sharpen, const bool ss_refl, const bool useNvidiaApi, const bool disable_dwm, const int BWrendering)
+    : m_windowHwnd(hwnd), m_width(width), m_height(height), m_fullscreen(fullscreen), 
+      m_colorDepth(colordepth), m_AAfactor(AAfactor), m_stereo3D(stereo3D),
+      m_ssRefl(ss_refl), m_disableDwm(disable_dwm), m_sharpen(sharpen), m_FXAA(FXAA), m_BWrendering(BWrendering), m_texMan(*this), m_renderFrame(this)
 {
-   bgfx::Init init = initReq;
-
-   // If using OpenGl on a WCG display, then create the OpenGL WCG context through SDL since BGFX does not support HDR10 under OpenGl
-   /* This won't work as is and needs more work as OpenGL is fairly wonky on this. The same approach could be used for Vulkan WCG but this is also not that well defined
-   if (rd->m_outputWnd[0]->IsWCGEnabled() && init.type == bgfx::RendererType::OpenGL)
-   {
-      SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 10); // HDR10
-      SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 10);
-      SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 10);
-      SDL_GL_SetAttribute(SDL_GL_FLOATBUFFERS, false);
-      SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 16); // RGB16F
-      SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 16);
-      SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 16);
-      SDL_GL_SetAttribute(SDL_GL_FLOATBUFFERS, true);
-      SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-      #ifndef __OPENGLES__
-         #if defined(__APPLE__) && defined(TARGET_OS_MAC)
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-         #else
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-            //This would enforce a 4.1 context, disabling all recent features (storage buffers, debug information,...)
-            //SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-            //SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-         #endif
-      #else
-         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-      #endif
-      init.platformData.context = SDL_GL_CreateContext(rd->m_outputWnd[0]->GetCore());
-      init.resolution.format = bgfx::TextureFormat::RGB10A2;
-   }*/
-
-   // If using OpenXR, we need to create a graphics layer adapted to OpenXR requirements
-   #ifdef ENABLE_XR
-   if (g_pplayer->m_vrDevice)
-   {
-      assert((init.resolution.reset & BGFX_RESET_VSYNC) == 0); // Display VSync must be disabled as we are synced by OpenXR on the headset display
-      init.type = bgfx::RendererType::Direct3D11; // TODO support other backends
-      init.resolution.width = max(init.resolution.width, static_cast<uint32_t>(g_pplayer->m_vrDevice->GetEyeWidth())); // Needed for bgfx::clear to work
-      init.resolution.height = max(init.resolution.height, static_cast<uint32_t>(g_pplayer->m_vrDevice->GetEyeHeight())); // Needed for bgfx::clear to work
-      init.platformData.context = g_pplayer->m_vrDevice->GetGraphicContext(); // Use the context selected by OpenXR
-   }
-   #endif
-
-   // Store the user requested VSync setting, but always initialize with VSync disabled as we will enable it when needed
-   const bool useVSync = init.resolution.reset & BGFX_RESET_VSYNC;
-   assert(!(useVSync && (g_pplayer->GetTargetRefreshRate() > rd->m_outputWnd[0]->GetRefreshRate()))); // VSync must be disabled if targeting a refresh rate higher than the display's one
-   init.resolution.reset &= ~BGFX_RESET_VSYNC;
-
-   g_pplayer->m_renderProfiler->SetThreadLock();
-
-   // BGFX default behavior is to set its 'API' thread (the one where bgfx API calls are allowed)
-   // as the one from which init is called, and spawn a BGFX render thread in charge of submitting
-   // render queue from the CPU to the GPU.
-   // Since VPX already splits the logic/prepare frame thread (CPU only) from the submit/flip (CPU-GPU)
-   // we do not really need BGFX to create its additional thread. Calling bgfx::renderFrame allows
-   // to do so, ending up with this thread being the only BGFX thread.
-   // This is also required for OpenXR which needs all the GPU submission calls to be performed after WaitFrame (sync) and between Begin/EndFrame
-   bgfx::renderFrame();
-
-   if (!bgfx::init(init))
-   {
-      PLOGE << "BGFX initialization failed";
-      exit(-1);
-   }
-   
-   #ifdef ENABLE_XR
-   if (g_pplayer->m_vrDevice)
-      g_pplayer->m_vrDevice->CreateSession();
-   #endif
-
-   // Enable HDR10 rendering if supported (so far, only DirectX 11 & 12 through DXGI)
-   if ((bgfx::getCaps()->supported & BGFX_CAPS_HDR10) && (g_pplayer->m_vrDevice == nullptr))
-   {
-      init.resolution.format = bgfx::TextureFormat::RGB10A2;
-      //init.resolution.format = bgfx::TextureFormat::RGBA16F; // Also supported by BGFX, but less efficient and would need and adjusted tonemapper to output in DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 colorspace (linear sRGB)
-      init.resolution.reset |= BGFX_RESET_HDR10;
-      bgfx::reset(init.resolution.width, init.resolution.height, init.resolution.reset, init.resolution.format);
-   }
-   
-   //bgfx::setDebug(BGFX_DEBUG_STATS);
-
-   // Create the back buffer render target
-   colorFormat back_buffer_format;
-   bool isWcg = false;
-   switch (init.resolution.format)
-   {
-   case bgfx::TextureFormat::RGBA16F: back_buffer_format = colorFormat::RGBA16F; isWcg = true; break;
-   case bgfx::TextureFormat::RGB10A2: back_buffer_format = colorFormat::RGBA10; isWcg = true; break;
-   case bgfx::TextureFormat::R5G6B5: back_buffer_format = colorFormat::RGB5; break;
-   case bgfx::TextureFormat::RGBA8: back_buffer_format = colorFormat::RGBA8; break;
-   default: assert(false); back_buffer_format = colorFormat::RGBA8;
-   }
-   if (g_pplayer->m_vrDevice)
-   {
-      rd->m_outputWnd[1] = rd->m_outputWnd[0]; // OS window is the preview window (first window is supposed to be main rendered window, as it is directly accessed by other objects, expecting a single render window)
-      rd->m_outputWnd[1]->SetBackBuffer(new RenderTarget(rd, SurfaceType::RT_DEFAULT, initReq.resolution.width, initReq.resolution.height, back_buffer_format), isWcg);
-      rd->m_outputWnd[0] = new VPX::Window(g_pplayer->m_vrDevice->GetEyeWidth(), g_pplayer->m_vrDevice->GetEyeHeight());
-      rd->m_nOutputWnd = 2;
-      rd->m_framePending = true; // Delay first frame preparation
-   }
-   else
-   {
-      rd->m_outputWnd[0]->SetBackBuffer(new RenderTarget(rd, SurfaceType::RT_DEFAULT, init.resolution.width, init.resolution.height, back_buffer_format), isWcg);
-      rd->m_framePending = false; // Request first frame to be prepared as soon as possible
-   }
-
-   // Unlock requesting thread and start render loop
-   rd->m_frameReadySem.post();
-
-   #ifdef __STANDALONE__
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-   #endif
-
-   #ifdef ENABLE_XR
-   if (g_pplayer->m_vrDevice)
-   {
-      // OpenXR renderloop, synchronized on headset (using xrWaitFrame), with game logic preparing frames when headset request them
-      while (rd->m_renderDeviceAlive)
-      {
-         // Process OpenXR events (headset status, ...)
-         g_pplayer->m_vrDevice->PollEvents();
-
-         // Let OpenXR throttle rendering, preparing frame on demand when view positions are acquired and predicted display time is defined
-         g_pplayer->m_vrDevice->RenderFrame(rd, [rd](RenderTarget * vrRenderTarget)
-         {
-            // FIXME No VR target, we should still render to the preview window
-            if (vrRenderTarget == nullptr)
-               return;
-
-            // Set acquired swapchain images as render target, request a new renderframe from GameLogic thread, and wait for it
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            span *tagSpanFF = new span(series, 1, _T("vpxWaitFrame"));
-            #endif
-            g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_WAIT);
-            rd->m_outputWnd[0]->SetBackBuffer(vrRenderTarget, false);
-            rd->m_framePending = false;
-            rd->m_frameReadySem.wait();
-            rd->m_outputWnd[0]->SetBackBuffer(nullptr, false); // as the vrRenderTarget is not valid outside of this scope
-            g_pplayer->m_renderProfiler->ExitProfileSection();
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            delete tagSpanFF;
-            #endif
-            if (!rd->m_framePending)
-            {
-               // Block rendering until we will acquire swapchain again
-               rd->m_framePending = true;
-               return;
-            }
-
-            // Submit frame to BGFX (which contains all rendering commands, for VR headset but also other windows like preview,...)
-            {
-               #ifdef MSVC_CONCURRENCY_VIEWER
-               span *tagSpan = new span(series, 1, _T("VPX->BGFX"));
-               #endif
-               std::lock_guard lock(rd->m_frameMutex);
-               g_pplayer->m_renderProfiler->NewFrame(g_pplayer->m_time_msec);
-               g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_SUBMIT);
-               rd->SubmitRenderFrame();
-               g_pplayer->m_vrDevice->UpdateVisibilityMask(rd);
-               g_pplayer->m_renderProfiler->ExitProfileSection();
-               #ifdef MSVC_CONCURRENCY_VIEWER
-               delete tagSpan;
-               #endif
-            }
-            
-            // Request BGFX to submit to GPU (calls bgfx::frame())
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            span* tagSpan = new span(series, 1, _T("BGFX->GPU"));
-            #endif
-            g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_FLIP);
-            rd->Flip();
-            const bgfx::Stats* stats = bgfx::getStats();
-            const U32 bgfxSubmit = static_cast<U32>((stats->cpuTimeEnd - stats->cpuTimeBegin) * 1000000ull / stats->cpuTimerFreq);
-            g_pplayer->m_logicProfiler.OnPresented(usec() - bgfxSubmit);
-            g_pplayer->m_renderProfiler->ExitProfileSection();
-            g_pplayer->m_renderProfiler->AdjustBGFXSubmit(bgfxSubmit);
-
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            delete tagSpan;
-            #endif
-         });
-      }
-      g_pplayer->m_vrDevice->ReleaseSession();
-      delete rd->m_outputWnd[0];
-      rd->m_outputWnd[0] = rd->m_outputWnd[1];
-      rd->m_nOutputWnd = 1;
-   }
-   else
-   #endif
-   {
-      U64 lastFlipTick = 0;
-      bool gpuVSync = false;
-
-      // Desktop renderloop, synchronized on main display (playfield window), with game logic preparing frames as soon as possible
-      while (rd->m_renderDeviceAlive)
-      {
-         // wait for a frame to be prepared by the logic thread
-         g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_WAIT);
-         rd->m_frameReadySem.wait();
-         g_pplayer->m_renderProfiler->ExitProfileSection();
-         if (!rd->m_framePending)
-            continue;
-         const bool noSync = rd->m_frameNoSync;
-         const bool needsVSync = useVSync && !noSync; // User as activated VSync and we are not processing an unsynced frame (offline rendering for example)   
-
-         // lock prepared frame and submit it
-         {
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            span *tagSpan = new span(series, 1, _T("VPX->BGFX"));
-            #endif
-            std::lock_guard lock(rd->m_frameMutex);
-            g_pplayer->m_renderProfiler->NewFrame(g_pplayer->m_time_msec);
-            g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_SUBMIT);
-            rd->m_framePending = false; // Request next frame to be prepared as soon as possible
-            rd->m_frameNoSync = false;
-            #ifdef _MSC_VER
-            // For Windows, only use GPU sync if we can't use DWM sync (GPU sync has issues when used with multiple monitors, and leads to higher visual latency)
-            if (!rd->m_dwm_enabled && (gpuVSync != needsVSync))
-            #else
-            if (gpuVSync != needsVSync)
-            #endif
-            {
-               gpuVSync = needsVSync;
-               bgfx::reset(init.resolution.width, init.resolution.height, init.resolution.reset | (gpuVSync ? BGFX_RESET_VSYNC : BGFX_RESET_NONE), init.resolution.format);
-            }
-            rd->SubmitRenderFrame();
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            delete tagSpan;
-            #endif
-            g_pplayer->m_renderProfiler->ExitProfileSection();
-         }
-
-         if (!noSync && // This is a synced frame (not offline rendering)
-              ((!useVSync && g_pplayer->GetTargetRefreshRate() < 10000.f) // the user has disabled VSync without an unbound FPS limit
-            || ( useVSync && g_pplayer->GetTargetRefreshRate() < rd->m_outputWnd[0]->GetRefreshRate()))) // the user has enabled VSync with a max FPS below the display FPS
-         {
-            g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_SLEEP);
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            span* tagSpan = new span(series, 1, _T("WaitSync"));
-            #endif
-            U64 now = usec();
-            const unsigned int targetFrameLength = useVSync ? (static_cast<unsigned int>(1000000. / (double)g_pplayer->GetTargetRefreshRate()) - 2000) // Keep some margin since, in the end, the sync will be done on hardware VSync (somewhat hacky, disallow VSync with low FPS ?)
-                                                            :  static_cast<unsigned int>(1000000. / (double)g_pplayer->GetTargetRefreshRate());
-            while (now - lastFlipTick < targetFrameLength)
-            {
-               g_pplayer->m_curFrameSyncOnFPS = true;
-               YieldProcessor();
-               now = usec();
-            }
-            lastFlipTick = now;
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            delete tagSpan;
-            #endif
-            g_pplayer->m_renderProfiler->ExitProfileSection();
-         }
-
-         // Flip (eventually blocking until a VSYNC happens) then submit render commands to GPU
-         {
-            g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_FLIP);
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            span* tagSpan = new span(series, 1, _T("BGFX->GPU"));
-            #endif
-            rd->Flip();
-            #ifdef _MSC_VER
-               // On Windows, sync on the main display using the composer instead of GPU VSync (this supposes that the playfield window is on the main display to behave correctly)
-               if (needsVSync && rd->m_dwm_enabled)
-                  rd->WaitForVSync(false);
-            #endif
-            if (s_screenshot) {
-               bgfx::requestScreenShot(BGFX_INVALID_HANDLE, s_screenshotFilename.c_str());
-               s_screenshot = false;
-            }
-            #ifdef MSVC_CONCURRENCY_VIEWER
-            delete tagSpan;
-            #endif
-            const bgfx::Stats* stats = bgfx::getStats();
-            const U32 bgfxSubmit = static_cast<U32>((stats->cpuTimeEnd - stats->cpuTimeBegin) * 1000000ull / stats->cpuTimerFreq);
-            g_pplayer->m_logicProfiler.OnPresented(usec() - bgfxSubmit);
-            g_pplayer->m_renderProfiler->ExitProfileSection();
-            g_pplayer->m_renderProfiler->AdjustBGFXSubmit(bgfxSubmit);
-         }
-      }
-   }
-   
-   // Wait until main thread has released all native resources
-   rd->m_frameReadySem.wait();
-   delete rd->m_outputWnd[0]->GetBackBuffer();
-   rd->m_outputWnd[0]->SetBackBuffer(nullptr);
-   bgfx::shutdown();
-}
-
-void RenderDevice::CaptureScreenshot(const string& filename, std::function<void(bool)> callback)
-{
-   if (s_screenshot) {
-      PLOGE.printf("Screenshot capture already in progress.");
-      callback(false);
-      return;
-   }
-
-   s_screenshotFilename = filename;
-   s_screenshotCallback = callback;
-   s_screenshot = true;
-}
+#ifdef ENABLE_SDL
+#ifdef ENABLE_VR
+   m_pHMD = nullptr;
+   m_rTrackedDevicePose = nullptr;
+#endif
+#else
+    m_useNvidiaApi = useNvidiaApi;
+    m_INTZ_support = false;
+    NVAPIinit = false;
 #endif
 
-RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nEyes, const bool useNvidiaApi, const bool disableDWM, const bool compressTextures, int nMSAASamples, VideoSyncMode& syncMode)
-   : m_texMan(*this)
-   , m_compressTextures(compressTextures)
-   , m_nEyes(nEyes)
-   , m_isVR(isVR)
-   , m_renderFrame(this)
-{
-   m_outputWnd[0] = wnd;
+    mDwmIsCompositionEnabled = (pDICE)GetProcAddress(GetModuleHandle(TEXT("dwmapi.dll")), "DwmIsCompositionEnabled"); //!! remove as soon as win xp support dropped and use static link
+    mDwmEnableComposition = (pDEC)GetProcAddress(GetModuleHandle(TEXT("dwmapi.dll")), "DwmEnableComposition"); //!! remove as soon as win xp support dropped and use static link
+    mDwmFlush = (pDF)GetProcAddress(GetModuleHandle(TEXT("dwmapi.dll")), "DwmFlush"); //!! remove as soon as win xp support dropped and use static link
 
-   assert(!isVR || m_nEyes == 2);
-
-   #if defined(ENABLE_DX9)
-      m_useNvidiaApi = useNvidiaApi;
-      m_INTZ_support = false;
-      NVAPIinit = false;
-   #endif
-
-#ifndef __STANDALONE__
-    BOOL dwm = 0;
-    DwmIsCompositionEnabled(&dwm);
-    m_dwm_enabled = m_dwm_was_enabled = !!dwm;
-
-    if (m_dwm_was_enabled && disableDWM && IsWindowsVistaOr7()) // windows 8 and above will not allow do disable it, but will still return S_OK
+    if (mDwmIsCompositionEnabled && mDwmEnableComposition)
     {
-        DwmEnableComposition(DWM_EC_DISABLECOMPOSITION);
+        BOOL dwm = 0;
+        mDwmIsCompositionEnabled(&dwm);
+        m_dwm_enabled = m_dwm_was_enabled = !!dwm;
+
+        if (m_dwm_was_enabled && m_disableDwm && IsWindowsVistaOr7()) // windows 8 and above will not allow do disable it, but will still return S_OK
+        {
+            mDwmEnableComposition(DWM_EC_DISABLECOMPOSITION);
+            m_dwm_enabled = false;
+        }
+    }
+    else
+    {
+        m_dwm_was_enabled = false;
         m_dwm_enabled = false;
     }
-#else
-    m_dwm_was_enabled = false;
-    m_dwm_enabled = false;
-#endif
+}
 
+void RenderDevice::CreateDevice(int& refreshrate, VideoSyncMode& syncMode, UINT adapterIndex)
+{
    assert(g_pplayer != nullptr); // Player must be created to give access to the output window
+   colorFormat back_buffer_format;
 
-   // 0 means disable limiting of draw-ahead queue
-   int maxPrerenderedFrames = isVR ? 0 : g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "MaxPrerenderedFrames"s, 0);
-
-   // Visual latency reduction
-   m_visualLatencyCorrection = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "VisualLatencyCorrection"s, -1);
-
-#if defined(ENABLE_BGFX)
-   ///////////////////////////////////
-   // BGFX device initialization
-   bgfx::Init init;
-   init.type = bgfx::RendererType::Count; // Tells BGFX to select the default backend for the running platform
-
-   // Limit to VSYNC on/off
-   syncMode = syncMode != VideoSyncMode::VSM_NONE ? VideoSyncMode::VSM_VSYNC : VideoSyncMode::VSM_NONE;
-   
-   static const string bgfxRendererNames[bgfx::RendererType::Count + 1]
-      = { "Noop"s, "Agc"s, "Direct3D11"s, "Direct3D12"s, "Gnm"s, "Metal"s, "Nvn"s, "OpenGLES"s, "OpenGL"s, "Vulkan"s, "Default"s };
-#ifdef __ANDROID__
-   string gfxBackend = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "GfxBackend"s, bgfxRendererNames[bgfx::RendererType::OpenGLES]);
-#elif defined(__APPLE__)
-   string gfxBackend = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "GfxBackend"s, bgfxRendererNames[bgfx::RendererType::Metal]);
-#else
-   string gfxBackend = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "GfxBackend"s, bgfxRendererNames[bgfx::RendererType::Vulkan]);
-#endif
-   bgfx::RendererType::Enum supportedRenderers[bgfx::RendererType::Count];
-   int nRendererSupported = bgfx::getSupportedRenderers(bgfx::RendererType::Count, supportedRenderers);
-   string supportedRendererLog;
-   for (int i = 0; i < nRendererSupported; ++i)
-   {
-      supportedRendererLog += (i == 0 ? "" : ", ") + bgfxRendererNames[supportedRenderers[i]];
-      if (gfxBackend == bgfxRendererNames[supportedRenderers[i]])
-         init.type = supportedRenderers[i];
-   }
-   PLOGI << "Using graphics backend: " << bgfxRendererNames[init.type] << " (available: " << supportedRendererLog << ')';
-   //init.type = bgfx::RendererType::Metal;
-   //init.type = bgfx::RendererType::OpenGL;
-   //init.type = bgfx::RendererType::OpenGLES;
-   //init.type = bgfx::RendererType::Vulkan;
-   //init.type = bgfx::RendererType::Direct3D11; // Present with VSYNC & outputs on multiple displays will sequentially sync on each display causing massive framerate drop
-   //init.type = bgfx::RendererType::Direct3D12; // Flasher & Ball rendering fails on a call to CreateGraphicsPipelineState, rendering artefacts
-
-   #ifndef __LIBVPINBALL__
-   m_useLowPrecision = init.type == bgfx::RendererType::OpenGLES;
-   #else
-   m_useLowPrecision = true;
-   #endif
-
-   init.callback = &bgfxCallback;
-
-   init.resolution.maxFrameLatency = maxPrerenderedFrames; // Maximum of Present operation queued (unrendered frame queued on GPU, waiting for an available backbuffer)
-
-   //init.resolution.numBackBuffers = 3; // Number of backbuffers (usually 3 as 1 is locked by compositor, 1 is displayed, 1 is rendered to)
-
-   // Enable max anisotropy texture filter setting (seems like there is no finer grained setting available in BGFX?).
-   init.resolution.reset = BGFX_RESET_MAXANISOTROPY;
-
-   // Flip (i.e Present) as soon as possible after submitting frame to limit latency.
-   init.resolution.reset |= BGFX_RESET_FLIP_AFTER_RENDER;
-
-   if (syncMode != VSM_NONE)
-      init.resolution.reset |= BGFX_RESET_VSYNC;
-
-   // Request a fullscreen swapchain to get independent flip and avoid compositor overhead
-   if (m_outputWnd[0]->IsFullScreen())
-      init.resolution.reset |= BGFX_RESET_FULLSCREEN;
-
-   init.resolution.width = wnd->GetWidth();
-   init.resolution.height = wnd->GetHeight();
-   switch (wnd->GetBitDepth())
-   {
-   case 32: init.resolution.format = bgfx::TextureFormat::RGBA8; break;
-   case 30: init.resolution.format = bgfx::TextureFormat::RGB10A2; break;
-   default: init.resolution.format = bgfx::TextureFormat::R5G6B5; break;
-   }
-
-   init.platformData.context = nullptr;
-   init.platformData.backBuffer = nullptr;
-   init.platformData.backBufferDS = nullptr;
-   #if BX_PLATFORM_LINUX || BX_PLATFORM_BSD
-   if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "x11") == 0) {
-      init.platformData.ndt = SDL_GetPointerProperty(SDL_GetWindowProperties(m_outputWnd[0]->GetCore()), SDL_PROP_WINDOW_X11_DISPLAY_POINTER, NULL);
-      init.platformData.nwh = (void*)SDL_GetNumberProperty(SDL_GetWindowProperties(m_outputWnd[0]->GetCore()), SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
-   }
-   else if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "wayland") == 0) {
-      init.platformData.ndt = SDL_GetPointerProperty(SDL_GetWindowProperties(m_outputWnd[0]->GetCore()), SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
-      init.platformData.nwh = SDL_GetPointerProperty(SDL_GetWindowProperties(m_outputWnd[0]->GetCore()), SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, NULL);
-   }
-   #elif BX_PLATFORM_OSX
-   init.platformData.nwh = SDL_GetRenderMetalLayer(SDL_CreateRenderer(m_outputWnd[0]->GetCore(), "Metal"));
-   #elif BX_PLATFORM_IOS
-   init.platformData.nwh = SDL_GetRenderMetalLayer(SDL_CreateRenderer(m_outputWnd[0]->GetCore(), "Metal"));
-   #elif BX_PLATFORM_ANDROID
-   init.platformData.nwh = SDL_GetPointerProperty(SDL_GetWindowProperties(m_outputWnd[0]->GetCore()), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
-   #elif BX_PLATFORM_WINDOWS
-   init.platformData.nwh = m_outputWnd[0]->GetNativeHWND();
-   #elif BX_PLATFORM_STEAMLINK
-   init.platformData.ndt = wmInfo.info.vivante.display;
-   init.platformData.nwh = wmInfo.info.vivante.window;
-   #endif // BX_PLATFORM_
-   #ifdef DEBUG
-   init.debug = true;
-   #endif
-
-   m_renderDeviceAlive = true;
-   m_renderThread = std::thread(&RenderThread, this, init);
-   m_frameReadySem.wait();
-   PLOGI << "BGFX initialized using " << bgfxRendererNames[bgfx::getRendererType()] << " backend";
-
-#elif defined(ENABLE_OPENGL)
+#ifdef ENABLE_SDL
    ///////////////////////////////////
    // OpenGL device initialization
-   const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(m_outputWnd[0]->GetAdapterId());
-   if (mode == nullptr)
+   const int displays = SDL_GetNumVideoDisplays();
+   if ((int)adapterIndex >= displays)
+      m_adapter = 0;
+   else
+      m_adapter = adapterIndex;
+
+   SDL_DisplayMode mode;
+   if (SDL_GetCurrentDisplayMode(m_adapter, &mode) != 0)
    {
-      ShowError("Failed to setup OpenGL context");
+      ShowError("Failed to setup SDL output window");
       exit(-1);
    }
-   colorFormat back_buffer_format;
-   switch (mode->format)
+   refreshrate = mode.refresh_rate;
+   bool video10bit = mode.format == SDL_PIXELFORMAT_ARGB2101010;
+   switch (mode.format)
    {
    case SDL_PIXELFORMAT_RGB565: back_buffer_format = colorFormat::RGB5; break;
-   case SDL_PIXELFORMAT_XRGB8888: back_buffer_format = colorFormat::RGB8; break;
+   case SDL_PIXELFORMAT_RGB888: back_buffer_format = colorFormat::RGB8; break;
    case SDL_PIXELFORMAT_ARGB8888: back_buffer_format = colorFormat::RGBA8; break;
    case SDL_PIXELFORMAT_ARGB2101010: back_buffer_format = colorFormat::RGBA10; break;
-   #ifdef __OPENGLES__
+#ifdef __OPENGLES__
    case SDL_PIXELFORMAT_ABGR8888: back_buffer_format = colorFormat::RGBA8; break;
    case SDL_PIXELFORMAT_RGBX8888: back_buffer_format = colorFormat::RGBA8; break;
-   case SDL_PIXELFORMAT_RGBA8888: back_buffer_format = colorFormat::RGBA8; break;
-   #endif
+#endif
    default:
    {
-      ShowError("Invalid Output format: "s.append(std::to_string(mode->format)));
+      ShowError("Invalid Output format: "s.append(std::to_string(mode.format).c_str()));
       exit(-1);
    }
    }
 
    memset(m_samplerStateCache, 0, sizeof(m_samplerStateCache));
 
-   #if defined(__OPENGLES__) || (defined(__APPLE__) && (defined(TARGET_OS_IOS) && TARGET_OS_IOS))
-   m_useLowPrecision = true;
-   #else
-   m_useLowPrecision = false;
-   #endif
+   m_sdl_playfieldHwnd = g_pplayer->m_sdl_playfieldHwnd;
+   SDL_SysWMinfo wmInfo;
+   SDL_VERSION(&wmInfo.version);
+   SDL_GetWindowWMInfo(m_sdl_playfieldHwnd, &wmInfo);
+   m_windowHwnd = wmInfo.info.win.window;
 
-   // FIXME We only set bit depth for fullscreen desktop modes (otherwise, use the desktop bit depth)
-   int channelDepth = m_outputWnd[0]->GetBitDepth() == 32 ?  8 :
-                      m_outputWnd[0]->GetBitDepth() == 30 ? 10 :
-                                                             5;
-   if (m_outputWnd[0]->IsFullScreen())
-   {
-      SDL_GL_SetAttribute(SDL_GL_RED_SIZE, channelDepth);
-      SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, channelDepth);
-      SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, channelDepth);
-      SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
-      SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
-   }
+   m_sdl_context = SDL_GL_CreateContext(m_sdl_playfieldHwnd);
 
-   // Multisampling is performed on the offscreen buffers, not the window framebuffer
-   SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 0);
-   SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 0);
+   SDL_GL_MakeCurrent(m_sdl_playfieldHwnd, m_sdl_context);
 
-   #ifndef __OPENGLES__
-      #if defined(__APPLE__) && defined(TARGET_OS_MAC)
-         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-         SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
-         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-      #else
-         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-         //This would enforce a 4.1 context, disabling all recent features (storage buffers, debug information,...)
-         //SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-         //SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-      #endif
-   #else
-      SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-   #endif
-
-   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-
-   m_sdl_context = SDL_GL_CreateContext(m_outputWnd[0]->GetCore());
-
-   SDL_GL_MakeCurrent(m_outputWnd[0]->GetCore(), m_sdl_context);
-
-   #if defined(ENABLE_SDL_VIDEO) && defined(ENABLE_OPENGL)
-   int drawableWidth, drawableHeight, windowWidth, windowHeight;
-   SDL_GetWindowSizeInPixels(m_outputWnd[0]->GetCore(), &drawableWidth, &drawableHeight); // Size in pixels
-   SDL_GetWindowSize(m_outputWnd[0]->GetCore(), &windowWidth, &windowHeight); // Size in screen coordinates (taking in account HiDPI)
-   PLOGI << "SDL drawable size: " << drawableWidth << 'x' << drawableHeight << " (window size: " << windowWidth << 'x' << windowHeight << ")";
-   #endif
-
-   #ifndef __OPENGLES__
+#ifndef __OPENGLES__
    if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress))
-   #else
+#else
    if (!gladLoadGLES2((GLADloadfunc)SDL_GL_GetProcAddress))
-   #endif
+#endif
    {
       ShowError("Glad failed");
       exit(-1);
    }
 
-   #ifdef __STANDALONE__
-   unsigned int num_exts_i = 0;
-   glad_glGetIntegerv(GL_NUM_EXTENSIONS, (int*) &num_exts_i);
-   PLOGD.printf("%d extensions available", num_exts_i);
-   for(int index = 0; index < num_exts_i; index++) {
-      PLOGD.printf("%s", glad_glGetStringi(GL_EXTENSIONS, index));
-   }
-   #ifdef __OPENGLES__
+#ifdef __OPENGLES__
    int range[2];
    int precision;
    glGetShaderPrecisionFormat(GL_VERTEX_SHADER, GL_HIGH_FLOAT, range, &precision);
    PLOGD.printf("Vertex shader high precision float range: %d %d precision: %d", range[0], range[1], precision);
    glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &precision);
    PLOGD.printf("Fragment shader high precision float range: %d %d precision: %d", range[0], range[1], precision);
-   #endif
-   #endif
+#endif
 
    int gl_majorVersion = 0;
    int gl_minorVersion = 0;
    glGetIntegerv(GL_MAJOR_VERSION, &gl_majorVersion);
    glGetIntegerv(GL_MINOR_VERSION, &gl_minorVersion);
 
-   #ifndef __STANDALONE__
-   if (gl_majorVersion < 4 || (gl_majorVersion == 4 && gl_minorVersion < 3))
+   if (gl_majorVersion < 3 || (gl_majorVersion == 3 && gl_minorVersion < 2))
    {
-      const string errorMsg = "Your graphics card only supports OpenGL " + std::to_string(gl_majorVersion) + '.' + std::to_string(gl_minorVersion) + ", but VPX requires OpenGL 4.3 or newer.";
-      ShowError(errorMsg.c_str());
+      char errorMsg[256];
+      sprintf_s(errorMsg, sizeof(errorMsg), "Your graphics card only supports OpenGL %d.%d, but VPVR requires OpenGL 3.2 or newer.", gl_majorVersion, gl_minorVersion);
+      ShowError(errorMsg);
       exit(-1);
    }
-   #endif
 
    m_GLversion = gl_majorVersion * 100 + gl_minorVersion;
 
    // Enable debugging layer of OpenGL
-   #if defined(_DEBUG) && !defined(__OPENGLES__)
+#ifdef _DEBUG
+#ifndef __OPENGLES__
    glEnable(GL_DEBUG_OUTPUT); // on its own is the 'fast' version
    //glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS); // callback is in sync with errors, so a breakpoint can be placed on the callback in order to get a stacktrace for the GL error
    if (glad_glDebugMessageCallback)
    {
       glDebugMessageCallback(GLDebugMessageCallback, nullptr);
    }
-   #endif
-   #if 0
+#endif
+#endif
+#if 0
    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_FALSE); // disable all
    glDebugMessageControl(GL_DEBUG_SOURCE_API, GL_DEBUG_TYPE_ERROR, GL_DONT_CARE, 0, nullptr, GL_TRUE); // enable only errors
-   #endif
+#endif
+
+   /* This fails on some situations, just keep the requested size
+   GLint frameBuffer[4];
+   glGetIntegerv(GL_VIEWPORT, frameBuffer);
+   const int fbWidth = frameBuffer[2];
+   const int fbHeight = frameBuffer[3];
+   m_width = fbWidth;
+   m_height = fbHeight;
+   */
+
+#ifdef ENABLE_VR
+   m_scale = 1.0f; // Scale factor from scene (in VP units) to VR view (in meters)
+   if (m_stereo3D == STEREO_VR)
+   {
+      if (g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "ScaleToFixedWidth"s, false))
+      {
+         float width;
+         g_pplayer->m_ptable->get_Width(&width);
+         m_scale = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "ScaleAbsolute"s, 55.0f) * 0.01f / width;
+      }
+      else
+         m_scale = VPUTOCM(0.01f) * g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "ScaleRelative"s, 1.0f);
+      if (m_scale < VPUTOCM(0.01f))
+         m_scale = VPUTOCM(0.01f); // Scale factor for VPUnits to Meters
+      // Initialize VR, this will also override the render buffer size (m_width, m_height) to account for HMD render size and render the 2 eyes simultaneously
+      InitVR();
+   }
+   else
+#endif
+   if (m_stereo3D == STEREO_SBS)
+      // Side by side needs to fit the 2 views along the width, so each view is half the total width
+      m_width = m_width / 2;
+   else if (m_stereo3D == STEREO_TB)
+      // Top/Bottom (and interlaced) needs to fit the 2 views along the height, so each view is half the total height
+      m_height = m_height / 2;
 
    // Flip scheduling: 0 for immediate, 1 for synchronized with the vertical retrace, -1 for adaptive vsync (i.e. synchronized on vsync except for late frame)
    switch (syncMode)
@@ -932,7 +699,6 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
    case VideoSyncMode::VSM_VSYNC: SDL_GL_SetSwapInterval(1); break;
    case VideoSyncMode::VSM_ADAPTIVE_VSYNC: SDL_GL_SetSwapInterval(-1); break;
    case VideoSyncMode::VSM_FRAME_PACING: SDL_GL_SetSwapInterval(0); break;
-   default: break;
    }
 
    m_maxaniso = 0;
@@ -952,43 +718,61 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
       binding->clamp_v = SA_UNDEFINED;
       m_samplerBindings.push_back(binding);
    }
+   m_autogen_mipmap = true;
 
    SetRenderState(RenderState::ZFUNC, RenderState::Z_LESSEQUAL);
 
-   // Retrieve a reference to the back buffer.
-   wnd->SetBackBuffer(new RenderTarget(this, SurfaceType::RT_DEFAULT, wnd->GetWidth(), wnd->GetHeight(), back_buffer_format));
+#else
+    ///////////////////////////////////
+    // DirectX 9 device initialization
 
-#elif defined(ENABLE_DX9)
-   ///////////////////////////////////
-   // DirectX 9 device initialization
+    m_pD3DEx = nullptr;
+    m_pD3DDeviceEx = nullptr;
 
-   m_pD3DEx = nullptr;
-   m_pD3DDeviceEx = nullptr;
+#ifdef USE_D3D9EX
+    mDirect3DCreate9Ex = (pD3DC9Ex)GetProcAddress(GetModuleHandle(TEXT("d3d9.dll")), "Direct3DCreate9Ex"); //!! remove as soon as win xp support dropped and use static link
+    if (mDirect3DCreate9Ex)
+    {
+        const HRESULT hr = mDirect3DCreate9Ex(D3D_SDK_VERSION, &m_pD3DEx);
+        if (FAILED(hr) || (m_pD3DEx == nullptr))
+        {
+            ShowError("Could not create D3D9Ex object.");
+            throw 0;
+        }
+        m_pD3DEx->QueryInterface(__uuidof(IDirect3D9), reinterpret_cast<void**>(&m_pD3D));
+    }
+    else
+#endif
+    {
+        m_pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+        if (m_pD3D == nullptr)
+        {
+            ShowError("Could not create D3D9 object.");
+            throw 0;
+        }
+    }
 
-   m_useLowPrecision = false;
+    m_adapter = m_pD3D->GetAdapterCount() > adapterIndex ? adapterIndex : 0;
 
-   HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_pD3DEx);
-   if (FAILED(hr) || (m_pD3DEx == nullptr))
-   {
-      ShowError("Could not create D3D9Ex object.");
-      throw 0;
-   }
-   m_pD3DEx->QueryInterface(__uuidof(IDirect3D9), reinterpret_cast<void**>(&m_pD3D));
+    D3DDEVTYPE devtype = D3DDEVTYPE_HAL;
 
-   D3DDEVTYPE devtype = D3DDEVTYPE_HAL;
-   vector<VPX::Window::DisplayConfig> displays;
-   VPX::Window::GetDisplays(displays);
-   for (const VPX::Window::DisplayConfig& disp : displays)
-   {
-      if (disp.adapter == m_outputWnd[0]->GetAdapterId() && strstr(disp.GPU_Name, "PerfHUD") != nullptr)
-      {
-         devtype = D3DDEVTYPE_REF;
-         break;
-      }
-   }
+    // Look for 'NVIDIA PerfHUD' adapter
+    // If it is present, override default settings
+    // This only takes effect if run under NVPerfHud, otherwise does nothing
+    for (UINT adapter = 0; adapter < m_pD3D->GetAdapterCount(); adapter++)
+    {
+        D3DADAPTER_IDENTIFIER9 Identifier;
+        m_pD3D->GetAdapterIdentifier(adapter, 0, &Identifier);
+        if (strstr(Identifier.Description, "PerfHUD") != 0)
+        {
+            m_adapter = adapter;
+            devtype = D3DDEVTYPE_REF;
+            break;
+        }
+    }
 
-   D3DCAPS9 caps;
-   m_pD3D->GetDeviceCaps(m_outputWnd[0]->GetAdapterId(), devtype, &caps);
+    D3DCAPS9 caps;
+    m_pD3D->GetDeviceCaps(m_adapter, devtype, &caps);
 
     // check which parameters can be used for anisotropic filter
     m_mag_aniso = (caps.TextureFilterCaps & D3DPTFILTERCAPS_MAGFANISOTROPIC) != 0;
@@ -1000,21 +784,30 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
     if (((caps.TextureCaps & D3DPTEXTURECAPS_NONPOW2CONDITIONAL) != 0) || ((caps.TextureCaps & D3DPTEXTURECAPS_POW2) != 0))
         ShowError("D3D device does only support power of 2 textures");
 
+    //if (caps.NumSimultaneousRTs < 2)
+    //   ShowError("D3D device doesn't support multiple render targets!");
+
+    bool video10bit = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "Render10Bit"s, false);
+
+    if (!m_fullscreen && video10bit)
+    {
+        ShowError("10Bit-Monitor support requires 'Force exclusive Fullscreen Mode' to be also enabled!");
+        video10bit = false;
+    }
+
     // get the current display format
     D3DFORMAT format;
-    if (!m_outputWnd[0]->IsFullScreen())
+    if (!m_fullscreen)
     {
         D3DDISPLAYMODE mode;
-        CHECKD3D(m_pD3D->GetAdapterDisplayMode(m_outputWnd[0]->GetAdapterId(), &mode));
+        CHECKD3D(m_pD3D->GetAdapterDisplayMode(m_adapter, &mode));
         format = mode.Format;
+        refreshrate = mode.RefreshRate;
     }
     else
     {
-        format = m_outputWnd[0]->GetBitDepth() == 32 ? D3DFMT_X8R8G8B8 :
-                 m_outputWnd[0]->GetBitDepth() == 30 ? D3DFMT_A2R10G10B10 :
-                                                       D3DFMT_R5G6B5;
+        format = (D3DFORMAT)(video10bit ? colorFormat::RGBA10 : ((m_colorDepth == 16) ? colorFormat::RGB5 : colorFormat::RGB8));
     }
-    colorFormat back_buffer_format;
     switch (format)
     {
     case D3DFMT_R5G6B5: back_buffer_format = colorFormat::RGB5; break;
@@ -1023,56 +816,64 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
     case D3DFMT_A2R10G10B10: back_buffer_format = colorFormat::RGBA10; break;
     default:
     {
-        ShowError("Invalid Output format: " + std::to_string(format));
+        ShowError("Invalid Output format: "s.append(std::to_string(format)));
         exit(-1);
     }
     }
 
     D3DPRESENT_PARAMETERS params;
-    params.BackBufferWidth = wnd->GetWidth();
-    params.BackBufferHeight = wnd->GetHeight();
+    params.BackBufferWidth = m_width;
+    params.BackBufferHeight = m_height;
     params.BackBufferFormat = format;
     params.BackBufferCount = 1;
     params.MultiSampleType = D3DMULTISAMPLE_NONE;
     params.MultiSampleQuality = 0;
     params.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    params.hDeviceWindow = m_outputWnd[0]->GetCore();
-    params.Windowed = !m_outputWnd[0]->IsFullScreen();
+    params.hDeviceWindow = m_windowHwnd;
+    params.Windowed = !m_fullscreen;
     params.EnableAutoDepthStencil = FALSE;
     params.AutoDepthStencilFormat = D3DFMT_UNKNOWN; // ignored
     params.Flags = /*fullscreen ? D3DPRESENTFLAG_LOCKABLE_BACKBUFFER :*/ /*(stereo3D ?*/ 0 /*: D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL)*/
        ; // D3DPRESENTFLAG_LOCKABLE_BACKBUFFER only needed for SetDialogBoxMode() below, but makes rendering slower on some systems :/
-    params.FullScreen_RefreshRateInHz = m_outputWnd[0]->IsFullScreen() ? (UINT)m_outputWnd[0]->GetRefreshRate() : 0;
+    params.FullScreen_RefreshRateInHz = m_fullscreen ? refreshrate : 0;
     params.PresentationInterval = syncMode == VideoSyncMode::VSM_VSYNC ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 
+    // This is a horrible hack: DirectX only supports fake stereo made by rendering at half resolution for these mode
+    // but on the other hand, for DirectX, we do not implement clean separation between output buffer (which must be at full resolution)
+    // so we hack it back here.
+    if (g_pplayer->m_stereo3D == STEREO_SBS) // Side by side needs to fit the 2 views along the width, so each view is half the total width
+        params.BackBufferWidth *= 2;
+    else if (g_pplayer->m_stereo3D == STEREO_TB || m_stereo3D == STEREO_INT || m_stereo3D == STEREO_FLIPPED_INT) // Top/Bottom (and interlaced) needs to fit the 2 views along the height, so each view is half the total height
+        params.BackBufferHeight *= 2;
+
    // check if our HDR texture format supports/does sRGB conversion on texture reads, which must NOT be the case as we always set SRGBTexture=true independent of the format!
-   hr = m_pD3D->CheckDeviceFormat(m_outputWnd[0]->GetAdapterId(), devtype, params.BackBufferFormat, D3DUSAGE_QUERY_SRGBREAD, D3DRTYPE_TEXTURE, (D3DFORMAT)colorFormat::RGBA32F);
+   HRESULT hr = m_pD3D->CheckDeviceFormat(m_adapter, devtype, params.BackBufferFormat, D3DUSAGE_QUERY_SRGBREAD, D3DRTYPE_TEXTURE, (D3DFORMAT)colorFormat::RGBA32F);
    if (SUCCEEDED(hr))
       ShowError("D3D device does support D3DFMT_A32B32G32R32F SRGBTexture reads (which leads to wrong tex colors)");
    // now the same for our LDR/8bit texture format the other way round
-   hr = m_pD3D->CheckDeviceFormat(m_outputWnd[0]->GetAdapterId(), devtype, params.BackBufferFormat, D3DUSAGE_QUERY_SRGBREAD, D3DRTYPE_TEXTURE, (D3DFORMAT)colorFormat::RGBA8);
+   hr = m_pD3D->CheckDeviceFormat(m_adapter, devtype, params.BackBufferFormat, D3DUSAGE_QUERY_SRGBREAD, D3DRTYPE_TEXTURE, (D3DFORMAT)colorFormat::RGBA8);
    if (!SUCCEEDED(hr))
       ShowError("D3D device does not support D3DFMT_A8R8G8B8 SRGBTexture reads (which leads to wrong tex colors)");
 
    // check if auto generation of mipmaps can be used, otherwise will be done via d3dx
    m_autogen_mipmap = (caps.Caps2 & D3DCAPS2_CANAUTOGENMIPMAP) != 0;
    if (m_autogen_mipmap)
-      m_autogen_mipmap = (m_pD3D->CheckDeviceFormat(m_outputWnd[0]->GetAdapterId(), devtype, params.BackBufferFormat, textureUsage::AUTOMIPMAP, D3DRTYPE_TEXTURE, (D3DFORMAT)colorFormat::RGBA8) == D3D_OK);
+      m_autogen_mipmap = (m_pD3D->CheckDeviceFormat(m_adapter, devtype, params.BackBufferFormat, textureUsage::AUTOMIPMAP, D3DRTYPE_TEXTURE, (D3DFORMAT)colorFormat::RGBA8) == D3D_OK);
 
    //m_autogen_mipmap = false; //!! could be done to support correct sRGB/gamma correct generation of mipmaps which is not possible with auto gen mipmap in DX9! at the moment disabled, as the sRGB software path is super slow for similar mipmap filter quality
 
-   #ifndef DISABLE_FORCE_NVIDIA_OPTIMUS
+#ifndef DISABLE_FORCE_NVIDIA_OPTIMUS
    if (!NVAPIinit && NvAPI_Initialize() == NVAPI_OK)
       NVAPIinit = true;
-   #endif
+#endif
 
    // Determine if INTZ is supported
-   m_INTZ_support = (m_pD3D->CheckDeviceFormat(m_outputWnd[0]->GetAdapterId(), devtype, params.BackBufferFormat,
+   m_INTZ_support = (m_pD3D->CheckDeviceFormat( m_adapter, devtype, params.BackBufferFormat,
                      D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, ((D3DFORMAT)(MAKEFOURCC('I','N','T','Z'))))) == D3D_OK;
 
    // check if requested MSAA is possible
    DWORD MultiSampleQualityLevels;
-   if (!SUCCEEDED(m_pD3D->CheckDeviceMultiSampleType(m_outputWnd[0]->GetAdapterId(),
+   if (!SUCCEEDED(m_pD3D->CheckDeviceMultiSampleType(m_adapter,
       devtype, params.BackBufferFormat,
       params.Windowed, params.MultiSampleType, &MultiSampleQualityLevels)))
    {
@@ -1086,12 +887,13 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
    const bool softwareVP = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "SoftwareVertexProcessing"s, false);
    const DWORD flags = softwareVP ? D3DCREATE_SOFTWARE_VERTEXPROCESSING : D3DCREATE_HARDWARE_VERTEXPROCESSING;
 
-   // Create the D3Dex device. This optionally goes to the proper fullscreen mode.
+   // Create the D3D device. This optionally goes to the proper fullscreen mode.
    // It also creates the default swap chain (front and back buffer).
+   if (m_pD3DEx)
    {
       D3DDISPLAYMODEEX mode;
       mode.Size = sizeof(D3DDISPLAYMODEEX);
-      if (m_outputWnd[0]->IsFullScreen())
+      if (m_fullscreen)
       {
          mode.Format = params.BackBufferFormat;
          mode.Width = params.BackBufferWidth;
@@ -1101,16 +903,16 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
       }
 
       hr = m_pD3DEx->CreateDeviceEx(
-         m_outputWnd[0]->GetAdapterId(),
+         m_adapter,
          devtype,
-         m_outputWnd[0]->GetCore(),
+         m_windowHwnd,
          flags /*| D3DCREATE_PUREDEVICE*/,
          &params,
-         m_outputWnd[0]->IsFullScreen() ? &mode : nullptr,
+         m_fullscreen ? &mode : nullptr,
          &m_pD3DDeviceEx);
       if (FAILED(hr))
       {
-         if (m_outputWnd[0]->IsFullScreen())
+         if (m_fullscreen)
          {
             const int result = GetSystemMetrics(SM_REMOTESESSION);
             const bool isRemoteSession = (result != 0);
@@ -1123,20 +925,33 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
       m_pD3DDeviceEx->QueryInterface(__uuidof(IDirect3DDevice9), reinterpret_cast<void**>(&m_pD3DDevice));
 
       // Get the display mode so that we can report back the actual refresh rate.
-      // Not done anymore as the refresh rate is validated before creation
-      // CHECKD3D(m_pD3DDeviceEx->GetDisplayModeEx(0, &mode, nullptr)); //!! what is the actual correct value for the swapchain here?
-      // refreshrate = mode.RefreshRate;
-   }
+      CHECKD3D(m_pD3DDeviceEx->GetDisplayModeEx(0, &mode, nullptr)); //!! what is the actual correct value for the swapchain here?
 
-   if (maxPrerenderedFrames > 0 && maxPrerenderedFrames <= 20)
+      refreshrate = mode.RefreshRate;
+   }
+   else
    {
-      CHECKD3D(m_pD3DDeviceEx->SetMaximumFrameLatency(maxPrerenderedFrames));
+      hr = m_pD3D->CreateDevice(
+         m_adapter,
+         devtype,
+         m_windowHwnd,
+         flags /*| D3DCREATE_PUREDEVICE*/,
+         &params,
+         &m_pD3DDevice);
+
+      if (FAILED(hr))
+         ReportError("Fatal Error: unable to create D3D device!", hr, __FILE__, __LINE__);
+
+      // Get the display mode so that we can report back the actual refresh rate.
+      D3DDISPLAYMODE mode;
+      hr = m_pD3DDevice->GetDisplayMode(m_adapter, &mode);
+      if (FAILED(hr))
+         ReportError("Fatal Error: unable to get supported video mode list!", hr, __FILE__, __LINE__);
+
+      refreshrate = mode.RefreshRate;
    }
 
-   // Retrieve a reference to the back buffer.
-   wnd->SetBackBuffer(new RenderTarget(this, SurfaceType::RT_DEFAULT, wnd->GetWidth(), wnd->GetHeight(), back_buffer_format));
-
-   /*if (m_outputWnd[0]->IsFullScreen())
+   /*if (m_fullscreen)
        hr = m_pD3DDevice->SetDialogBoxMode(TRUE);*/ // needs D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, but makes rendering slower on some systems :/
 #endif
 
@@ -1147,30 +962,92 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
    m_nullTexture->SetName("Null"s);
    delete surf;
 
+   // Retrieve a reference to the back buffer.
+   int backBufferWidth, backBufferHeight;
+#ifdef ENABLE_SDL
+   SDL_GL_GetDrawableSize(m_sdl_playfieldHwnd, &backBufferWidth, &backBufferHeight);
+#else
+   backBufferWidth = m_width;
+   backBufferHeight = m_height;
+#endif
+   m_pBackBuffer = new RenderTarget(this, backBufferWidth, backBufferHeight, back_buffer_format);
+
+#ifdef ENABLE_SDL
+   const colorFormat render_format = ((m_BWrendering == 1) ? colorFormat::RG16F : ((m_BWrendering == 2) ? colorFormat::RED16F : colorFormat::RGB16F));
+#else
+   const colorFormat render_format = ((m_BWrendering == 1) ? colorFormat::RG16F : ((m_BWrendering == 2) ? colorFormat::RED16F : colorFormat::RGBA16F));
+#endif
+   // alloc float buffer for rendering (optionally AA factor res for manual super sampling)
+   int m_width_aa = (int)((float)m_width * m_AAfactor);
+   int m_height_aa = (int)((float)m_height * m_AAfactor);
+
    // alloc float buffer for rendering
-   #if defined(ENABLE_OPENGL)
+   int nMSAASamples = (g_pplayer != nullptr) ? g_pplayer->m_MSAASamples : 1;
+#ifdef ENABLE_SDL
    int maxSamples;
    glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
    nMSAASamples = min(maxSamples, nMSAASamples);
+#endif
+
+   #ifdef ENABLE_SDL
+   SurfaceType rtType = m_stereo3D == STEREO_OFF ? SurfaceType::RT_DEFAULT : SurfaceType::RT_STEREO;
+   #else
+   // For the time being DirectX 9 does not support any fancy stereo
+   SurfaceType rtType = SurfaceType::RT_DEFAULT;
+   #endif
+   
+   // MSAA render target which is resolved to the non MSAA render target
+   if (nMSAASamples > 1) 
+      m_pOffscreenMSAABackBufferTexture = new RenderTarget(this, rtType, "MSAABackBuffer"s, m_width_aa, m_height_aa, render_format, true, nMSAASamples, "Fatal Error: unable to create MSAA render buffer!");
+
+   // Either the main render target for non MSAA, or the buffer where the MSAA render is resolved
+   m_pOffscreenBackBufferTexture1 = new RenderTarget(this, rtType, "BackBuffer1"s, m_width_aa, m_height_aa, render_format, true, 1, "Fatal Error: unable to create offscreen back buffer");
+
+   // Second render target to swap, allowing to read previous frame render for ball reflection and motion blur
+   m_pOffscreenBackBufferTexture2 = m_pOffscreenBackBufferTexture1->Duplicate("BackBuffer2"s, true);
+
+   // alloc buffer for screen space fake reflection rendering
+   if (m_ssRefl)
+      m_pReflectionBufferTexture = new RenderTarget(this, rtType, "ReflectionBuffer"s, m_width_aa, m_height_aa, render_format, false, 1, "Fatal Error: unable to create reflection buffer!");
+
+   // alloc bloom tex at 1/4 x 1/4 res (allows for simple HQ downscale of clipped input while saving memory)
+   m_pBloomBufferTexture = new RenderTarget(this, rtType, "BloomBuffer1"s, m_width / 4, m_height / 4, render_format, false, 1, "Fatal Error: unable to create bloom buffer!");
+   m_pBloomTmpBufferTexture = m_pBloomBufferTexture->Duplicate("BloomBuffer2"s);
+
+   #ifdef ENABLE_SDL
+   if (m_stereo3D == STEREO_VR) {
+      //AMD Debugging
+      colorFormat renderBufferFormatVR;
+      const int textureModeVR = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "EyeFBFormat"s, 1);
+      switch (textureModeVR) {
+      case 0:
+         renderBufferFormatVR = RGB8;
+         break;
+      case 2:
+         renderBufferFormatVR = RGB16F;
+         break;
+      case 3:
+         renderBufferFormatVR = RGBA16F;
+         break;
+      case 1:
+      default:
+         renderBufferFormatVR = RGBA8;
+         break;
+      }
+      m_pOffscreenVRLeft = new RenderTarget(this, SurfaceType::RT_DEFAULT, "VRLeft"s, m_width, m_height, renderBufferFormatVR, false, 1, "Fatal Error: unable to create left eye buffer!");
+      m_pOffscreenVRRight = new RenderTarget(this, SurfaceType::RT_DEFAULT, "VRRight"s, m_width, m_height, renderBufferFormatVR, false, 1, "Fatal Error: unable to create right eye buffer!");
+   }
    #endif
 
+   // Buffers for post-processing (postprocess is done at scene resolution, on a LDR render target without MSAA or full scene supersampling)
+   if (video10bit && (m_FXAA == Quality_SMAA || m_FXAA == Standard_DLAA))
+      ShowError("SMAA or DLAA post-processing AA should not be combined with 10bit-output rendering (will result in visible artifacts)!");
+
+#ifndef ENABLE_SDL
    // create default vertex declarations for shaders
-   #if defined(ENABLE_BGFX)
-   m_pVertexTexelDeclaration = new bgfx::VertexLayout; // TODO remove Pos/TexCoord format and only use one Pos/Normal/TexCoord
-   m_pVertexTexelDeclaration->begin()
-      .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
-      .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
-      .end();
-   m_pVertexNormalTexelDeclaration = new bgfx::VertexLayout;
-   m_pVertexNormalTexelDeclaration->begin()
-      .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
-      .add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float)
-      .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
-      .end();
-   #elif defined(ENABLE_DX9)
    CHECKD3D(m_pD3DDevice->CreateVertexDeclaration(VertexTexelElement, &m_pVertexTexelDeclaration));
    CHECKD3D(m_pD3DDevice->CreateVertexDeclaration(VertexNormalTexelElement, &m_pVertexNormalTexelDeclaration));
-   #endif
+#endif
 
    // Vertex buffers
    static constexpr float verts[4 * 5] =
@@ -1180,27 +1057,22 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
        1.0f, -1.0f, 0.0f, 1.0f, 1.0f,
       -1.0f, -1.0f, 0.0f, 0.0f, 1.0f
    };
-   #if defined(ENABLE_BGFX)
-   static constexpr float reversedVerts[4 * 5] =
-   {
-       1.0f,  1.0f, 0.0f, 1.0f, 1.0f,
-      -1.0f,  1.0f, 0.0f, 0.0f, 1.0f,
-       1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
-      -1.0f, -1.0f, 0.0f, 0.0f, 0.0f
-   };
-   VertexBuffer* quadVertexBuffer = new VertexBuffer(this, 4, bgfx::getCaps()->originBottomLeft ? reversedVerts : verts, false, VertexFormat::VF_POS_TEX);
-   #else
+   delete m_quadMeshBuffer;
    VertexBuffer* quadVertexBuffer = new VertexBuffer(this, 4, verts, false, VertexFormat::VF_POS_TEX);
-   #endif
    m_quadMeshBuffer = new MeshBuffer(L"Fullscreen Quad"s, quadVertexBuffer);
 
-   #if defined(ENABLE_OPENGL)
+#ifdef ENABLE_SDL
+   delete m_quadPNTDynMeshBuffer;
    VertexBuffer* quadPNTDynVertexBuffer = new VertexBuffer(this, 4, nullptr, true, VertexFormat::VF_POS_NORMAL_TEX);
    m_quadPNTDynMeshBuffer = new MeshBuffer(quadPNTDynVertexBuffer);
 
+   delete m_quadPTDynMeshBuffer;
    VertexBuffer* quadPTDynVertexBuffer = new VertexBuffer(this, 4, nullptr, true, VertexFormat::VF_POS_TEX);
    m_quadPTDynMeshBuffer = new MeshBuffer(quadPTDynVertexBuffer);
-   #endif
+#endif
+
+   // Always load the (small) SMAA textures since SMAA can be toggled at runtime through the live UI
+   UploadAndSetSMAATextures();
 
    // Force applying a defined initial render state
    m_current_renderstate.m_state = (~m_renderstate.m_state) & ((1 << 21) - 1);
@@ -1209,154 +1081,243 @@ RenderDevice::RenderDevice(VPX::Window* const wnd, const bool isVR, const int nE
    
    // Ensure we have a VSync source for frame pacing
    bool hasVSync = false;
-   if (m_dwm_enabled)
+   if (m_dwm_enabled && mDwmFlush)
    {
-      PLOGI << "VSync source set to Windows Desktop compositor (DwmFlush)";
+      PLOGI << "VSync source set to Desktop compositor (DwmFlush)";
       hasVSync = true;
    }
-   #if defined(ENABLE_DX9)
-      else
+   #ifndef ENABLE_SDL
+   else if (m_pD3DDeviceEx != nullptr)
+   {
+      PLOGI << "VSync source set to DX9Ex WaitForBlank";
+      hasVSync = true;
+   }
+   #endif
+   #ifdef ENABLE_SDL
+   // DXGI VSync source (Windows 7+, only used in OpenGL build)
+   else if (syncMode == VideoSyncMode::VSM_FRAME_PACING)
+   {
+      DXGIRegistry::Output* out = g_DXGIRegistry.GetForWindow(m_windowHwnd);
+      if (out != nullptr)
+         m_DXGIOutput = out->m_Output;
+      if (m_DXGIOutput != nullptr)
       {
-         PLOGI << "VSync source set to DX9Ex WaitForBlank";
+	      PLOGI << "VSync source set to DXGI WaitForBlank";
          hasVSync = true;
       }
-   #elif defined(ENABLE_SDL_VIDEO) && defined(ENABLE_OPENGL) && !defined(__STANDALONE__)
-      // DXGI VSync source (Windows 7+, only used for Win32 SDL with OpenGL)
-      else if (syncMode == VideoSyncMode::VSM_FRAME_PACING)
-      {
-         DXGIRegistry::Output* out = g_DXGIRegistry.GetForWindow(m_outputWnd[0]->GetNativeHWND());
-         if (out != nullptr)
-            m_DXGIOutput = out->m_Output;
-         if (m_DXGIOutput != nullptr)
-         {
-            PLOGI << "VSync source set to DXGI WaitForBlank";
-            hasVSync = true;
-         }
-      }
+   }
    #endif
-   
    if (syncMode == VideoSyncMode::VSM_FRAME_PACING && !hasVSync)
    {
-      // This may happen on some old config where DWM is disabled
+      // This may happen on some old config where D3D9ex is not available (XP/Vista/7) and DWM is disabled
       ShowError("Failed to create the synchronization device.\r\nSynchronization switched to adaptive sync.");
       PLOGE << "Failed to create the synchronization device for frame pacing. Synchronization switched to adaptive sync.";
       syncMode = VideoSyncMode::VSM_ADAPTIVE_VSYNC;
-      #if defined(ENABLE_OPENGL)
+      #ifdef ENABLE_SDL
       SDL_GL_SetSwapInterval(-1);
       #endif
    }
+}
 
-   m_basicShader = new Shader(this, Shader::BASIC_SHADER, m_nEyes == 2);
-   m_ballShader = new Shader(this, Shader::BALL_SHADER, m_nEyes == 2);
-   m_DMDShader = new Shader(this, m_isVR ? Shader::DMD_VR_SHADER : Shader::DMD_SHADER, m_nEyes == 2);
-   m_flasherShader = new Shader(this, Shader::FLASHER_SHADER, m_nEyes == 2);
-   m_lightShader = new Shader(this, Shader::LIGHT_SHADER, m_nEyes == 2);
-   m_stereoShader = new Shader(this, Shader::STEREO_SHADER, m_nEyes == 2);
-   m_FBShader = new Shader(this, Shader::POSTPROCESS_SHADER, m_nEyes == 2);
+bool RenderDevice::LoadShaders()
+{
+#ifdef ENABLE_SDL // OpenGL
+   basicShader = new Shader(this, "BasicShader.glfx"s);
+   DMDShader = new Shader(this, m_stereo3D == STEREO_VR ? "DMDShaderVR.glfx"s : "DMDShader.glfx"s);
+   FBShader = new Shader(this, "FBShader.glfx"s, "SMAA.glfx"s);
+   flasherShader = new Shader(this, "FlasherShader.glfx"s);
+   lightShader = new Shader(this, "LightShader.glfx"s);
+   StereoShader = new Shader(this, "StereoShader.glfx"s);
+   m_ballShader = new Shader(this, "BallShader.glfx"s);
+#else // DirectX 9
+   basicShader = new Shader(this, "BasicShader.hlsl"s, g_basicShaderCode, sizeof(g_basicShaderCode));
+   DMDShader = new Shader(this, "DMDShader.hlsl"s, g_dmdShaderCode, sizeof(g_dmdShaderCode));
+   FBShader = new Shader(this, "FBShader.hlsl"s, g_FBShaderCode, sizeof(g_FBShaderCode));
+   flasherShader = new Shader(this, "FlasherShader.hlsl"s, g_flasherShaderCode, sizeof(g_flasherShaderCode));
+   lightShader = new Shader(this, "LightShader.hlsl"s, g_lightShaderCode, sizeof(g_lightShaderCode));
+   StereoShader = new Shader(this, "StereoShader.hlsl"s, g_stereoShaderCode, sizeof(g_stereoShaderCode));
+   m_ballShader = new Shader(this, "BallShader.hlsl"s, g_ballShaderCode, sizeof(g_ballShaderCode));
+#endif
 
-   if (m_basicShader->HasError() || m_DMDShader->HasError() || m_FBShader->HasError() || m_flasherShader->HasError() || m_lightShader->HasError() || m_stereoShader->HasError())
+   if (basicShader->HasError() || DMDShader->HasError() || FBShader->HasError() || flasherShader->HasError() || lightShader->HasError() || StereoShader->HasError())
    {
       ReportError("Fatal Error: shader compilation failed!", -1, __FILE__, __LINE__);
-      throw(-1);
+      return false;
    }
 
    // Initialize uniform to default value
-   m_basicShader->SetVector(SHADER_staticColor_Alpha, 1.0f, 1.0f, 1.0f, 1.0f); // No tinting
-   // FIXME XR
-   #ifndef ENABLE_XR
-   m_DMDShader->SetFloat(SHADER_alphaTestValue, 1.0f); // No alpha clipping
-   #endif
+   basicShader->SetVector(SHADER_w_h_height, (float)(1.0 / (double)GetMSAABackBufferTexture()->GetWidth()), (float)(1.0 / (double)GetMSAABackBufferTexture()->GetHeight()), 0.0f, 0.0f);
+   basicShader->SetVector(SHADER_staticColor_Alpha, 1.0f, 1.0f, 1.0f, 1.0f); // No tinting
+   DMDShader->SetFloat(SHADER_alphaTestValue, 1.0f); // No alpha clipping
+   FBShader->SetTexture(SHADER_areaTex, m_SMAAareaTexture);
+   FBShader->SetTexture(SHADER_searchTex, m_SMAAsearchTexture);
 
-   #if !defined(__OPENGLES__)
-      // Always load the (small) SMAA textures since SMAA can be toggled at runtime through the live UI
-      UploadAndSetSMAATextures();
-   #endif
+   return true;
+}
+
+RenderTarget* RenderDevice::GetPostProcessRenderTarget1()
+{
+   if (m_pPostProcessRenderTarget1 == nullptr)
+   {
+      // Buffers for post-processing. Postprocess is done at scene resolution, on a LDR render target without MSAA nor full scene supersampling
+      // excepted when using downsampled render buffer where upscaling is done after postprocessing.
+      const colorFormat pp_format = GetBackBufferTexture()->GetColorFormat() == RGBA10 ? colorFormat::RGBA10 : colorFormat::RGBA8;
+      int width = m_AAfactor < 1 ? m_pOffscreenBackBufferTexture1->GetWidth() : m_width;
+      int height = m_AAfactor < 1 ? m_pOffscreenBackBufferTexture1->GetHeight() : m_height;
+      m_pPostProcessRenderTarget1 = new RenderTarget(this, m_pOffscreenBackBufferTexture1->m_type, "PostProcess1"s, width, height, pp_format, false, 1, 
+         "Fatal Error: unable to create stereo3D/post-processing AA/sharpen buffer!");
+   }
+   return m_pPostProcessRenderTarget1;
+}
+   
+RenderTarget* RenderDevice::GetPostProcessRenderTarget2()
+{
+   if (m_pPostProcessRenderTarget2 == nullptr)
+      m_pPostProcessRenderTarget2 = GetPostProcessRenderTarget1()->Duplicate("PostProcess2"s);
+   return m_pPostProcessRenderTarget2;
+}
+
+RenderTarget* RenderDevice::GetPostProcessRenderTarget(RenderTarget* renderedRT)
+{
+   RenderTarget* pp1 = GetPostProcessRenderTarget1();
+   if (renderedRT == pp1)
+      return GetPostProcessRenderTarget2();
+   else
+      return pp1;
+}
+
+RenderTarget* RenderDevice::GetAORenderTarget(int idx)
+{
+   // Lazily creates AO render target since this can be enabled during play from script (at render buffer resolution)
+   if (m_pAORenderTarget1 == nullptr)
+   {
+      m_pAORenderTarget1 = new RenderTarget(this, m_pOffscreenBackBufferTexture1->m_type, "AO1"s, 
+         m_pOffscreenBackBufferTexture1->GetWidth(), m_pOffscreenBackBufferTexture1->GetHeight(), colorFormat::GREY8, false, 1, 
+         "Unable to create AO buffers!\r\nPlease disable Ambient Occlusion.\r\nOr try to (un)set \"Alternative Depth Buffer processing\" in the video options!");
+      m_pAORenderTarget2 = m_pAORenderTarget1->Duplicate("AO2"s);
+
+   }
+   return idx == 0 ? m_pAORenderTarget1 : m_pAORenderTarget2;
+}
+
+void RenderDevice::SwapBackBufferRenderTargets()
+{
+   RenderTarget* tmp = m_pOffscreenBackBufferTexture1;
+   m_pOffscreenBackBufferTexture1 = m_pOffscreenBackBufferTexture2;
+   m_pOffscreenBackBufferTexture2 = tmp;
+}
+
+void RenderDevice::SwapAORenderTargets()
+{
+   RenderTarget* tmpAO = m_pAORenderTarget1;
+   m_pAORenderTarget1 = m_pAORenderTarget2;
+   m_pAORenderTarget2 = tmpAO;
+}
+
+void RenderDevice::ResolveMSAA()
+{
+   if (m_pOffscreenMSAABackBufferTexture)
+   {
+      const RenderPass* initial_rt = GetCurrentPass();
+      SetRenderTarget("Resolve MSAA"s, m_pOffscreenBackBufferTexture1);
+      BlitRenderTarget(m_pOffscreenMSAABackBufferTexture, m_pOffscreenBackBufferTexture1, true, true);
+      SetRenderTarget(initial_rt->m_name + '+', initial_rt->m_rt);
+   }
+}
+
+bool RenderDevice::DepthBufferReadBackAvailable()
+{
+#ifdef ENABLE_SDL
+   return true;
+#else
+    if (m_INTZ_support && !m_useNvidiaApi)
+        return true;
+    // fall back to NVIDIAs NVAPI, only handle DepthBuffer ReadBack if API was initialized
+    return NVAPIinit;
+#endif
+}
+
+
+void RenderDevice::FreeShader()
+{
+   UnbindSampler(nullptr);
+   delete basicShader;
+   basicShader = nullptr;
+   delete DMDShader;
+   DMDShader = nullptr;
+   delete FBShader;
+   FBShader = nullptr;
+   delete StereoShader;
+   StereoShader = nullptr;
+   delete flasherShader;
+   flasherShader = nullptr;
+   delete lightShader;
+   lightShader = nullptr;
+   delete m_ballShader;
+   m_ballShader = nullptr;
+}
+
+void RenderDevice::UnbindSampler(Sampler* sampler)
+{
+   if (basicShader)
+      basicShader->UnbindSampler(sampler);
+   if (DMDShader)
+      DMDShader->UnbindSampler(sampler);
+   if (FBShader)
+      FBShader->UnbindSampler(sampler);
+   if (flasherShader)
+      flasherShader->UnbindSampler(sampler);
+   if (lightShader)
+      lightShader->UnbindSampler(sampler);
+   if (StereoShader)
+      StereoShader->UnbindSampler(sampler);
+   if (m_ballShader)
+      m_ballShader->UnbindSampler(sampler);
 }
 
 RenderDevice::~RenderDevice()
 {
-   #if defined(ENABLE_BGFX)
-      // Suspend rendering before deleting anything that could be used
-      m_renderDeviceAlive = false;
-      m_frameReadySem.post();
-   #endif
-
    delete m_quadMeshBuffer;
-   m_quadMeshBuffer = nullptr;
+   delete m_quadPTDynMeshBuffer;
+   delete m_quadPNTDynMeshBuffer;
    delete m_nullTexture;
-   m_nullTexture = nullptr;
 
-   #if defined(ENABLE_DX9)
-      m_pD3DDevice->SetStreamSource(0, nullptr, 0, 0);
-      m_pD3DDevice->SetIndices(nullptr);
-      m_pD3DDevice->SetVertexShader(nullptr);
-      m_pD3DDevice->SetPixelShader(nullptr);
-      m_pD3DDevice->SetFVF(D3DFVF_XYZ);
-      m_pD3DDevice->SetDepthStencilSurface(nullptr);
-      SAFE_RELEASE(m_pVertexTexelDeclaration);
-      SAFE_RELEASE(m_pVertexNormalTexelDeclaration);
-   #endif
+#ifndef ENABLE_SDL
+   m_pD3DDevice->SetStreamSource(0, nullptr, 0, 0);
+   m_pD3DDevice->SetIndices(nullptr);
+   m_pD3DDevice->SetVertexShader(nullptr);
+   m_pD3DDevice->SetPixelShader(nullptr);
+   m_pD3DDevice->SetFVF(D3DFVF_XYZ);
+   m_pD3DDevice->SetDepthStencilSurface(nullptr);
+   SAFE_RELEASE(m_pVertexTexelDeclaration);
+   SAFE_RELEASE(m_pVertexNormalTexelDeclaration);
+#endif
 
-   UnbindSampler(nullptr);
-   delete m_basicShader;
-   m_basicShader = nullptr;
-   delete m_DMDShader;
-   m_DMDShader = nullptr;
-   delete m_FBShader;
-   m_FBShader = nullptr;
-   delete m_stereoShader;
-   m_stereoShader = nullptr;
-   delete m_flasherShader;
-   m_flasherShader = nullptr;
-   delete m_lightShader;
-   m_lightShader = nullptr;
-   delete m_ballShader;
-   m_ballShader = nullptr;
+   FreeShader();
 
    m_texMan.UnloadAll();
+   delete m_pOffscreenBackBufferTexture1;
+   delete m_pOffscreenBackBufferTexture2;
+   delete m_pPostProcessRenderTarget1;
+   delete m_pPostProcessRenderTarget2;
+   delete m_pReflectionBufferTexture;
 
-   for (unsigned int i = 0; i < m_nOutputWnd; i++)
-   {
-      delete m_outputWnd[i]->GetBackBuffer();
-      m_outputWnd[i]->SetBackBuffer(nullptr);
-   }
+   delete m_pBloomBufferTexture;
+   delete m_pBloomTmpBufferTexture;
+   delete m_pBackBuffer;
+   delete m_pOffscreenVRLeft;
+   delete m_pOffscreenVRRight;
+
+   delete m_pAORenderTarget1;
+   delete m_pAORenderTarget2;
 
    delete m_SMAAareaTexture;
    delete m_SMAAsearchTexture;
 
-#if defined(ENABLE_BGFX)
-   delete m_pVertexTexelDeclaration;
-   delete m_pVertexNormalTexelDeclaration;
+#ifndef ENABLE_SDL
 
-   // Shutdown BGFX once all native resources have been cleaned up
-   m_frameReadySem.post();
-   if (m_renderThread.joinable())
-      m_renderThread.join();
-
-#elif defined(ENABLE_OPENGL)
-   for (auto binding : m_samplerBindings)
-      delete binding;
-   m_samplerBindings.clear();
-
-   for (size_t i = 0; i < std::size(m_samplerStateCache); i++)
-   {
-      if (m_samplerStateCache[i] != 0)
-      {
-         glDeleteSamplers(1, &m_samplerStateCache[i]);
-         m_samplerStateCache[i] = 0;
-      }
-   }
-
-   delete m_quadPTDynMeshBuffer;
-   delete m_quadPNTDynMeshBuffer;
-
-   SDL_GL_DestroyContext(m_sdl_context);
-
-   assert(m_sharedVAOs.empty());
-
-#elif defined(ENABLE_DX9)
    // Check for resource leak on debug builds
-   #ifdef _DEBUG
+#ifdef _DEBUG
    IDirect3DSwapChain9* swapChain;
    CHECKD3D(m_pD3DDevice->GetSwapChain(0, &swapChain));
 
@@ -1371,27 +1332,26 @@ RenderDevice::~RenderDevice()
    {
       g_pvp->MessageBox("WARNING! Direct3D resource leak detected!", "Visual Pinball", MB_ICONWARNING);
    }
-   #endif
+#endif
 
+   //!! if (m_pD3DDeviceEx == m_pD3DDevice) m_pD3DDevice = nullptr; //!! needed for Caligula if m_adapter > 0 ?? weird!! BUT MESSES UP FULLSCREEN EXIT (=hangs)
    SAFE_RELEASE_NO_RCC(m_pD3DDeviceEx);
-   #ifdef DEBUG_REFCOUNT_TRIGGER
+#ifdef DEBUG_REFCOUNT_TRIGGER
    SAFE_RELEASE(m_pD3DDevice);
-   #else
+#else
    FORCE_RELEASE(m_pD3DDevice); //!! why is this necessary for some setups? is the refcount still off for some settings?
-   #endif
-
-   #ifndef DISABLE_FORCE_NVIDIA_OPTIMUS
+#endif
+#ifndef DISABLE_FORCE_NVIDIA_OPTIMUS
    if (NVAPIinit) //!! meh
       CHECKNVAPI(NvAPI_Unload());
    NVAPIinit = false;
-   #endif
-
+#endif
    SAFE_RELEASE_NO_RCC(m_pD3DEx);
-   #ifdef DEBUG_REFCOUNT_TRIGGER
+#ifdef DEBUG_REFCOUNT_TRIGGER
    SAFE_RELEASE(m_pD3D);
-   #else
+#else
    FORCE_RELEASE(m_pD3D); //!! why is this necessary for some setups? is the refcount still off for some settings?
-   #endif
+#endif
 
    /*
     * D3D sets the FPU to single precision/round to nearest int mode when it's initialized,
@@ -1400,127 +1360,82 @@ RenderDevice::~RenderDevice()
    _fpreset();
 
    if (m_dwm_was_enabled)
-      DwmEnableComposition(DWM_EC_ENABLECOMPOSITION);
+      mDwmEnableComposition(DWM_EC_ENABLECOMPOSITION);
+#else
+   for (auto binding : m_samplerBindings)
+      delete binding;
+   m_samplerBindings.clear();
+#ifdef ENABLE_VR
+   if (m_pHMD)
+      turnVROff();
+#endif
+
+   for (size_t i = 0; i < sizeof(m_samplerStateCache)/sizeof(m_samplerStateCache[0]); i++)
+   {
+      if (m_samplerStateCache[i] != 0)
+      {
+         glDeleteSamplers(1, &m_samplerStateCache[i]);
+         m_samplerStateCache[i] = 0;
+      }
+   }
+
+   SDL_GL_DeleteContext(m_sdl_context);
+   SDL_DestroyWindow(m_sdl_playfieldHwnd);
+
+   assert(m_sharedVAOs.empty());
 #endif
 
    assert(m_pendingSharedIndexBuffers.empty());
    assert(m_pendingSharedVertexBuffers.empty());
 }
 
-void RenderDevice::AddWindow(VPX::Window* wnd)
+/*static void FlushGPUCommandBuffer(IDirect3DDevice9* pd3dDevice)
 {
-   assert(wnd->GetBackBuffer() == nullptr);
-   if (m_nOutputWnd >= 8)
-      return;
+   IDirect3DQuery9* pEventQuery;
+   pd3dDevice->CreateQuery(D3DQUERYTYPE_EVENT, &pEventQuery);
 
-#if defined(ENABLE_BGFX) && (ENABLE_SDL_VIDEO)
-   if ((bgfx::getCaps()->supported & BGFX_CAPS_SWAP_CHAIN) == 0)
-      return;
-
-   colorFormat fmt;
-   switch (wnd->GetBitDepth())
+   if (pEventQuery)
    {
-   case 32: fmt = colorFormat::RGBA8; break;
-   case 30: fmt = colorFormat::RGBA10; break;
-   default: fmt = colorFormat::RGB5; break;
+      pEventQuery->Issue(D3DISSUE_END);
+      while (S_FALSE == pEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH))
+         ;
+      SAFE_RELEASE(pEventQuery);
    }
-   SDL_Window* sdlWnd = wnd->GetCore();
-   void* nwh;
-#if BX_PLATFORM_LINUX || BX_PLATFORM_BSD
-   void* ndt;
-   if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "x11") == 0) {
-      ndt = SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWnd), SDL_PROP_WINDOW_X11_DISPLAY_POINTER, NULL);
-      nwh = (void*)SDL_GetNumberProperty(SDL_GetWindowProperties(sdlWnd), SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
-   }
-   else if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "wayland") == 0) {
-      ndt = SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWnd), SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
-      nwh = SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWnd), SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, NULL);
-   }
-#elif BX_PLATFORM_OSX
-   nwh = SDL_GetRenderMetalLayer(SDL_CreateRenderer(sdlWnd, "Metal"));
-#elif BX_PLATFORM_IOS
-   nwh = SDL_GetRenderMetalLayer(SDL_CreateRenderer(sdlWnd, "Metal"));
-#elif BX_PLATFORM_ANDROID
-   nwh = SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWnd), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
-#elif BX_PLATFORM_WINDOWS
-   nwh = wnd->GetNativeHWND();
-#elif BX_PLATFORM_STEAMLINK
-   nwh = wmInfo.info.vivante.window;
-#else
-   return nullptr;
-#endif // BX_PLATFORM_
-   bgfx::FrameBufferHandle fbh = bgfx::createFrameBuffer(nwh, uint16_t(wnd->GetWidth()), uint16_t(wnd->GetHeight()));
-   m_outputWnd[m_nOutputWnd] = wnd;
-   m_nOutputWnd++;
-   wnd->SetBackBuffer(new RenderTarget(this, SurfaceType::RT_DEFAULT, fbh, BGFX_INVALID_HANDLE, BGFX_INVALID_HANDLE, "BackBuffer #" + std::to_string(m_nOutputWnd), wnd->GetWidth(), wnd->GetHeight(), fmt));
-#endif
-}
+}*/
 
-bool RenderDevice::DepthBufferReadBackAvailable()
+bool RenderDevice::SetMaximumPreRenderedFrames(const DWORD frames)
 {
-#if defined(ENABLE_OPENGL) || defined(ENABLE_BGFX)
-   return true;
-#elif defined(ENABLE_DX9)
-   if (m_INTZ_support && !m_useNvidiaApi)
+#ifndef ENABLE_SDL
+   if (m_pD3DEx && frames > 0 && frames <= 20) // frames can range from 1 to 20, 0 resets to default DX
+   {
+      CHECKD3D(m_pD3DDeviceEx->SetMaximumFrameLatency(frames));
       return true;
-   // fall back to NVIDIAs NVAPI, only handle DepthBuffer ReadBack if API was initialized
-   return NVAPIinit;
+   }
+   else
 #endif
-}
-
-void RenderDevice::UnbindSampler(Sampler* sampler)
-{
-   if (m_basicShader)
-      m_basicShader->UnbindSampler(sampler);
-   if (m_DMDShader)
-      m_DMDShader->UnbindSampler(sampler);
-   if (m_FBShader)
-      m_FBShader->UnbindSampler(sampler);
-   if (m_flasherShader)
-      m_flasherShader->UnbindSampler(sampler);
-   if (m_lightShader)
-      m_lightShader->UnbindSampler(sampler);
-   if (m_stereoShader)
-      m_stereoShader->UnbindSampler(sampler);
-   if (m_ballShader)
-      m_ballShader->UnbindSampler(sampler);
-}
-
-float RenderDevice::GetPredictedDisplayDelayInS() const
-{
-   // OpenXR perform frame pacing with display time prediction
-   if (g_pplayer->m_vrDevice)
-      return g_pplayer->m_vrDevice->GetPredictedDisplayDelayInS();
-
-   // Suppose a constant delay of at least 1 frame (in most situation, this will be at least 2 or 3 times higher)
-   if (m_visualLatencyCorrection < 0)
-      return 1.f / g_pplayer->GetTargetRefreshRate();
-
-   // User has measured his setup latency
-   return m_visualLatencyCorrection * 1e-3f;
+      return false;
 }
 
 void RenderDevice::WaitForVSync(const bool asynchronous)
 {
-   // - DWM can be either on or off for Windows Vista/7, it is always enabled for Windows 8+ except on stripped down versions of Windows like Ghost Spectre
+   // - DWM is always disabled for Windows XP, it can be either on or off for Windows Vista/7, it is always enabled for Windows 8+ except on stripped down versions of Windows like Ghost Spectre
    // - Windows XP does not offer any way to sync beside the present parameter on device creation, so this is enforced there and the vsync parameter will be ignored here
    //   (note that the present parameter does not directly sync: it schedules the flip on vsync, leading the GPU to block on another render call, since no backbuffer is available for drawing then)
    auto lambda = [this]()
    {
-#ifndef __STANDALONE__
-      if (m_dwm_enabled)
-         DwmFlush(); // Flush all commands submitted by this process including the 'Present' command. This actually syncs to the vertical blank
-      #if defined(ENABLE_OPENGL)
+      if (m_dwm_enabled && mDwmFlush != nullptr)
+         mDwmFlush(); // Flush all commands submited by this process including the 'Present' command. This actually sync to the vertical blank
+      #ifdef ENABLE_SDL
       else if (m_DXGIOutput != nullptr)
          m_DXGIOutput->WaitForVBlank();
-      #elif defined(ENABLE_DX9)
+      #else
       // When DWM is disabled (Windows Vista/7), exclusive fullscreen without DWM (pre-windows 10), special Windows builds with DWM stripped out (Ghost Spectre Windows 10)
-      else
+      else if (m_pD3DDeviceEx != nullptr)
          m_pD3DDeviceEx->WaitForVBlank(0);
       #endif
-#endif
       m_vsyncCount++;
-      //const U64 now = usec();
+      const U64 now = usec();
+      m_lastVSyncUs = now;
       //static U64 lastUs = 0;
       //PLOGD_(PLOG_NO_DBG_OUT_INSTANCE_ID) << "VSYNC " << ((double)(now - lastUs) / 1000.0) << "ms";
       //lastUs = now;
@@ -1539,8 +1454,20 @@ void RenderDevice::Flip()
    // calls, we need to schedule frames at a pace adjusted to the actual render speed (to avoid filling up the queue, leading to subsequent call to wait).
    //
    // This matters and should be avoided since these blocking calls will delay the input/physics update (they catchup afterward) and that 
-   // it will break some PinMAME video modes (since input events will be fast forwarded, the controller misses some like in Lethal 
+   // it will break some pinmame video modes (since input events will be fast forwarded, the controller missing somes like in Lethal 
    // Weapon 3 fight) and make the gameplay (input lag, input-physics sync, input-controller sync) to depend on the framerate.
+
+   // Ensure that all commands have been submitted to the CPU, then pushed to the GPU
+   FlushRenderFrame();
+
+   // Schedule frame presentation (non blocking call, simply queueing the present command in the driver's render queue with a schedule for execution)
+   if (m_stereo3D != STEREO_VR)
+      g_frameProfiler.OnPresent();
+   #ifdef ENABLE_SDL
+   SDL_GL_SwapWindow(m_sdl_playfieldHwnd);
+   #else
+   CHECKD3D(m_pD3DDevice->Present(nullptr, nullptr, nullptr, nullptr));
+   #endif
 
    // reset performance counters
    m_frameDrawCalls = m_curDrawCalls;
@@ -1559,55 +1486,18 @@ void RenderDevice::Flip()
    m_curTextureUpdates = 0;
    m_frameLockCalls = m_curLockCalls;
    m_curLockCalls = 0;
-
-   // Schedule frame presentation (non blocking call, simply queueing the present command in the driver's render queue with a schedule for execution)
-   #if defined(ENABLE_BGFX)
-   // Process pending texture upload/mipmap generation before flipping the frame
-   for (auto it = m_pendingTextureUploads.cbegin(); it != m_pendingTextureUploads.cend();)
-   {
-      (*it)->GetCoreTexture(true);
-      if ((*it)->IsMipMapGenerated())
-      {
-         it = m_pendingTextureUploads.erase(it);
-      }
-      else
-      {
-         ++it;
-      }
-   }
-   SubmitAndFlipFrame();
-
-   #elif defined(ENABLE_OPENGL)
-   SDL_GL_SwapWindow(m_outputWnd[0]->GetCore());
-   if (!m_isVR)
-      g_pplayer->m_logicProfiler.OnPresented(usec());
-
-   #elif defined(ENABLE_DX9)
-   CHECKD3D(m_pD3DDevice->Present(nullptr, nullptr, nullptr, nullptr));
-   if (!m_isVR)
-      g_pplayer->m_logicProfiler.OnPresented(usec());
-   #endif
 }
 
 void RenderDevice::UploadAndSetSMAATextures()
 {
-   // TODO use standard BaseTexture / Sampler code instead
+   // FIXME use standard BaseTexture / Sampler code instead
    /* BaseTexture* searchBaseTex = new BaseTexture(SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, BaseTexture::BW);
    memcpy(searchBaseTex->data(), searchTexBytes, SEARCHTEX_SIZE);
    m_SMAAsearchTexture = new Sampler(this, searchBaseTex, true, SamplerAddressMode::SA_CLAMP, SamplerAddressMode::SA_CLAMP, SamplerFilter::SF_NONE);
    m_SMAAsearchTexture->SetName("SMAA Search"s);
    delete searchBaseTex;*/
 
-#if defined(ENABLE_BGFX)
-   bgfx::TextureHandle smaaAreaTex = bgfx::createTexture2D(AREATEX_WIDTH, AREATEX_HEIGHT, false, 1, bgfx::TextureFormat::RG8, BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, bgfx::makeRef(areaTexBytes, AREATEX_SIZE));
-   m_SMAAareaTexture = new Sampler(this, SurfaceType::RT_DEFAULT, smaaAreaTex, AREATEX_WIDTH, AREATEX_HEIGHT, true, true, SamplerAddressMode::SA_CLAMP, SamplerAddressMode::SA_CLAMP, SamplerFilter::SF_BILINEAR);
-   m_SMAAareaTexture->SetName("SMAA Area"s);
-
-   bgfx::TextureHandle smaaSearchTex = bgfx::createTexture2D(SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, false, 1, bgfx::TextureFormat::R8, BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, bgfx::makeRef(searchTexBytes, SEARCHTEX_SIZE));
-   m_SMAAsearchTexture = new Sampler(this, SurfaceType::RT_DEFAULT, smaaSearchTex, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, true, true, SamplerAddressMode::SA_CLAMP, SamplerAddressMode::SA_CLAMP, SamplerFilter::SF_NONE);
-   m_SMAAsearchTexture->SetName("SMAA Search"s);
-
-#elif defined(ENABLE_OPENGL)
+#ifdef ENABLE_SDL
    auto tex_unit = m_samplerBindings.back();
    if (tex_unit->sampler != nullptr)
       tex_unit->sampler->m_bindings.erase(tex_unit);
@@ -1638,7 +1528,7 @@ void RenderDevice::UploadAndSetSMAATextures()
    m_SMAAareaTexture = new Sampler(this, SurfaceType::RT_DEFAULT, glTexture[1], true, true, SamplerAddressMode::SA_CLAMP, SamplerAddressMode::SA_CLAMP, SamplerFilter::SF_BILINEAR);
    m_SMAAareaTexture->SetName("SMAA Area"s);
 
-#elif defined(ENABLE_DX9)
+#else
    {
       IDirect3DTexture9 *sysTex, *tex;
       HRESULT hr = m_pD3DDevice->CreateTexture(SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, 0, 0, D3DFMT_L8, D3DPOOL_SYSTEMMEM, &sysTex, nullptr);
@@ -1686,25 +1576,12 @@ void RenderDevice::UploadAndSetSMAATextures()
       m_SMAAareaTexture->SetName("SMAA Area"s);
    }
 #endif
-
-   m_FBShader->SetTexture(SHADER_areaTex, m_SMAAareaTexture);
-   m_FBShader->SetTexture(SHADER_searchTex, m_SMAAsearchTexture);
-}
-
-void RenderDevice::UploadTexture(BaseTexture* texture, const bool linearRGB)
-{
-   Sampler* sampler = m_texMan.LoadTexture(texture, SamplerFilter::SF_UNDEFINED, SamplerAddressMode::SA_UNDEFINED, SamplerAddressMode::SA_UNDEFINED, linearRGB);
-   #if defined(ENABLE_BGFX)
-   // BGFX dispatch operations to the render thread, so the texture manager does not actually loads data to the GPU nor perform mipmap generation
-   m_pendingTextureUploads.push_back(sampler);
-   #endif
 }
 
 void RenderDevice::SetSamplerState(int unit, SamplerFilter filter, SamplerAddressMode clamp_u, SamplerAddressMode clamp_v)
 {
-#if defined(ENABLE_BGFX)
-#elif defined(ENABLE_OPENGL)
-   assert(std::size(m_samplerStateCache) == 3*3*5);
+#ifdef ENABLE_SDL
+   assert(sizeof(m_samplerStateCache)/sizeof(m_samplerStateCache[0]) == 3*3*5);
    int samplerStateId = min((int)clamp_u, 2) * 5 * 3
                       + min((int)clamp_v, 2) * 5
                       + min((int)filter, 4);
@@ -1730,12 +1607,12 @@ void RenderDevice::SetSamplerState(int unit, SamplerFilter filter, SamplerAddres
          glSamplerParameteri(sampler_state, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
          glSamplerParameterf(sampler_state, GL_TEXTURE_MAX_ANISOTROPY, 1.0f);
          break;
-      case SF_BILINEAR: // Bilinear texture filtering.
+      case SF_BILINEAR: // Bilinar texture filtering.
          glSamplerParameteri(sampler_state, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
          glSamplerParameteri(sampler_state, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
          glSamplerParameterf(sampler_state, GL_TEXTURE_MAX_ANISOTROPY, 1.0f);
          break;
-      case SF_TRILINEAR: // Trilinear texture filtering.
+      case SF_TRILINEAR: // Trilinar texture filtering.
          glSamplerParameteri(sampler_state, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
          glSamplerParameteri(sampler_state, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
          glSamplerParameterf(sampler_state, GL_TEXTURE_MAX_ANISOTROPY, 1.0f);
@@ -1749,7 +1626,7 @@ void RenderDevice::SetSamplerState(int unit, SamplerFilter filter, SamplerAddres
    }
    glBindSampler(unit, sampler_state);
    m_curStateChanges++;
-#elif defined(ENABLE_DX9)
+#else
    if (filter != m_bound_filter[unit])
    {
       switch (filter)
@@ -1864,35 +1741,26 @@ void RenderDevice::CopyRenderStates(const bool copyTo, RenderDeviceState& state)
 {
    assert(state.m_rd == this);
    CopyRenderStates(copyTo, state.m_renderState);
-   m_basicShader->m_state->CopyTo(copyTo, state.m_basicShaderState);
-   m_DMDShader->m_state->CopyTo(copyTo, state.m_DMDShaderState);
-   m_FBShader->m_state->CopyTo(copyTo, state.m_FBShaderState);
-   m_flasherShader->m_state->CopyTo(copyTo, state.m_flasherShaderState);
-   m_lightShader->m_state->CopyTo(copyTo, state.m_lightShaderState);
+   basicShader->m_state->CopyTo(copyTo, state.m_basicShaderState);
+   DMDShader->m_state->CopyTo(copyTo, state.m_DMDShaderState);
+   FBShader->m_state->CopyTo(copyTo, state.m_FBShaderState);
+   flasherShader->m_state->CopyTo(copyTo, state.m_flasherShaderState);
+   lightShader->m_state->CopyTo(copyTo, state.m_lightShaderState);
    m_ballShader->m_state->CopyTo(copyTo, state.m_ballShaderState);
-   m_stereoShader->m_state->CopyTo(copyTo, state.m_stereoShaderState);
+   StereoShader->m_state->CopyTo(copyTo, state.m_stereoShaderState);
 }
 
 void RenderDevice::SetClipPlane(const vec4 &plane)
 {
-#if defined(__OPENGLES__)
-   // FIXME GLES implement (or use BGFX OpenGL ES implementation)
-   return;
-#elif defined(ENABLE_BGFX)
-   m_DMDShader->SetVector(SHADER_clip_plane, &plane);
-   m_basicShader->SetVector(SHADER_clip_plane, &plane);
-   m_lightShader->SetVector(SHADER_clip_plane, &plane);
-   m_flasherShader->SetVector(SHADER_clip_plane, &plane);
+#ifdef ENABLE_SDL
+   DMDShader->SetVector(SHADER_clip_plane, &plane);
+   basicShader->SetVector(SHADER_clip_plane, &plane);
+   lightShader->SetVector(SHADER_clip_plane, &plane);
+   flasherShader->SetVector(SHADER_clip_plane, &plane);
    m_ballShader->SetVector(SHADER_clip_plane, &plane);
-#elif defined(ENABLE_OPENGL)
-   m_DMDShader->SetVector(SHADER_clip_plane, &plane);
-   m_basicShader->SetVector(SHADER_clip_plane, &plane);
-   m_lightShader->SetVector(SHADER_clip_plane, &plane);
-   m_flasherShader->SetVector(SHADER_clip_plane, &plane);
-   m_ballShader->SetVector(SHADER_clip_plane, &plane);
-#elif defined(ENABLE_DX9)
-   // FIXME DX9 shouldn't we set the Model matrix to identity first ?
-   Matrix3D mT = g_pplayer->m_renderer->GetMVP().GetModelViewProj(0); // = world * view * proj
+#else
+   // FIXME shouldn't we set the Model matrix to identity first ?
+   Matrix3D mT = g_pplayer->m_pin3d.GetMVP().GetModelViewProj(0); // = world * view * proj
    mT.Invert();
    mT.Transpose();
    const D3DXMATRIX m(mT);
@@ -1903,39 +1771,12 @@ void RenderDevice::SetClipPlane(const vec4 &plane)
 #endif
 }
 
-void RenderDevice::SubmitRenderFrame()
+void RenderDevice::FlushRenderFrame()
 {
-   #ifdef ENABLE_BGFX
-   if (std::this_thread::get_id() != m_renderThread.get_id())
-   {
-      // post semaphore and wait for render thread to process frame
-      m_framePending = true;
-      m_frameNoSync = true;
-      m_frameMutex.unlock(); // release the lock and wait for render thread to process the frame
-      m_frameReadySem.post();
-      while (m_framePending)
-         //YieldProcessor();
-         Sleep(0);
-      m_frameMutex.lock();
-      return;
-   }
-   #endif
-
-   m_currentPass = nullptr;
    bool rendered = m_renderFrame.Execute(m_logNextFrame);
+   m_currentPass = nullptr;
    if (rendered)
       m_logNextFrame = false;
-   m_lastPresentFrameTick = usec();
-}
-
-void RenderDevice::DiscardRenderFrame()
-{
-   m_currentPass = nullptr;
-   m_renderFrame.Discard();
-   #ifdef ENABLE_BGFX
-      RenderTarget::OnFrameFlushed();
-      m_activeViewId = -1;
-   #endif
 }
 
 void RenderDevice::SetRenderTarget(const string& name, RenderTarget* rt, const bool useRTContent, const bool forceNewPass)
@@ -1947,7 +1788,6 @@ void RenderDevice::SetRenderTarget(const string& name, RenderTarget* rt, const b
    else if (m_currentPass == nullptr || !useRTContent || rt != m_currentPass->m_rt || forceNewPass)
    {
       m_currentPass = m_renderFrame.AddPass(name, rt);
-      m_currentPass->m_mergeable = !forceNewPass;
       if (useRTContent && rt->m_lastRenderPass != nullptr)
       {
          for (auto precursors : rt->m_lastRenderPass->m_dependencies)
@@ -1973,7 +1813,7 @@ void RenderDevice::AddRenderTargetDependencyOnNextRenderCommand(RenderTarget* rt
    m_nextRenderCommandDependency = rt->m_lastRenderPass;
 }
 
-void RenderDevice::Clear(const DWORD flags, const DWORD color)
+void RenderDevice::Clear(const DWORD flags, const D3DCOLOR color, const D3DVALUE z, const DWORD stencil)
 {
    ApplyRenderStates();
    RenderCommand* cmd = m_renderFrame.NewCommand();
@@ -2014,23 +1854,32 @@ void RenderDevice::RenderLiveUI()
    m_currentPass->Submit(cmd);
 }
 
-void RenderDevice::DrawTexturedQuad(Shader* shader, const Vertex3D_TexelOnly* vertices, const bool isTransparent, const float depth)
+void RenderDevice::RenderLiveUI(int LR)
 {
-   assert(shader == m_FBShader || shader == m_stereoShader); // FrameBuffer/Stereo shaders are the only ones using Position/Texture vertex format
-   ApplyRenderStates();
    RenderCommand* cmd = m_renderFrame.NewCommand();
-   cmd->SetDrawTexturedQuad(shader, vertices, isTransparent, depth);
+   cmd->SetRenderLiveUI(LR);
    cmd->m_dependency = m_nextRenderCommandDependency;
    m_nextRenderCommandDependency = nullptr;
    m_currentPass->Submit(cmd);
 }
 
-void RenderDevice::DrawTexturedQuad(Shader* shader, const Vertex3D_NoTex2* vertices, const bool isTransparent, const float depth)
+void RenderDevice::DrawTexturedQuad(Shader* shader, const Vertex3D_TexelOnly* vertices)
 {
-   assert(shader != m_FBShader && shader != m_stereoShader); // FrameBuffer/Stereo shaders are the only ones using Position/Texture vertex format
+   assert(shader == FBShader || shader == StereoShader); // FrameBuffer/Stereo shader are the only ones using Position/Texture vertex format
    ApplyRenderStates();
    RenderCommand* cmd = m_renderFrame.NewCommand();
-   cmd->SetDrawTexturedQuad(shader, vertices, isTransparent, depth);
+   cmd->SetDrawTexturedQuad(shader, vertices);
+   cmd->m_dependency = m_nextRenderCommandDependency;
+   m_nextRenderCommandDependency = nullptr;
+   m_currentPass->Submit(cmd);
+}
+
+void RenderDevice::DrawTexturedQuad(Shader* shader, const Vertex3D_NoTex2* vertices)
+{
+   assert(shader != FBShader && shader != StereoShader); // FrameBuffer/Stereo shader are the only ones using Position/Texture vertex format
+   ApplyRenderStates();
+   RenderCommand* cmd = m_renderFrame.NewCommand();
+   cmd->SetDrawTexturedQuad(shader, vertices);
    cmd->m_dependency = m_nextRenderCommandDependency;
    m_nextRenderCommandDependency = nullptr;
    m_currentPass->Submit(cmd);
@@ -2038,8 +1887,8 @@ void RenderDevice::DrawTexturedQuad(Shader* shader, const Vertex3D_NoTex2* verti
 
 void RenderDevice::DrawFullscreenTexturedQuad(Shader* shader)
 {
-   assert(shader == m_FBShader || shader == m_stereoShader); // FrameBuffer/Stereo shaders are the only ones using Position/Texture vertex format
-   static constexpr Vertex3Ds pos { 0.f, 0.f, 0.f };
+   assert(shader == FBShader || shader == StereoShader); // FrameBuffer/Stereo shader are the only ones using Position/Texture vertex format
+   static const Vertex3Ds pos(0.f, 0.f, 0.f);
    DrawMesh(shader, false, pos, 0.f, m_quadMeshBuffer, TRIANGLESTRIP, 0, 4);
 }
 
@@ -2047,9 +1896,9 @@ void RenderDevice::DrawMesh(Shader* shader, const bool isTranparentPass, const V
 {
    RenderCommand* cmd = m_renderFrame.NewCommand();
    // Legacy sorting order (only along negative z axis, which is reversed for reflections).
-   // This is completely wrong, but needed to preserve backward compatibility. We should sort along the view axis (especially for reflection probes)
-   const float depth = g_pplayer->m_renderer && g_pplayer->m_renderer->IsRenderPass(Renderer::REFLECTION_PASS) ? depthBias + center.z : depthBias - center.z;
-   // We can not use the real opacity from render states since some legacy code uses the alpha part that writes to the depth buffer (rendered during transparent pass) to mask out opaque parts
+   // This is completely wrong but needed to preserve backward compatibility. We should sort along the view axis (especially for reflection probes)
+   const float depth = g_pplayer->IsRenderPass(Player::REFLECTION_PASS) ? depthBias + center.z : depthBias - center.z;
+   // We can not use the real opacity from render states since some legacy uses alpha part that write to the depth buffer (rendered during transparent pass) to mask out opaque parts
    cmd->SetDrawMesh(shader, mb, type, startIndex, indexCount, isTranparentPass /* && !GetRenderState().IsOpaque() */, depth);
    cmd->m_dependency = m_nextRenderCommandDependency;
    m_nextRenderCommandDependency = nullptr;
@@ -2105,7 +1954,7 @@ void RenderDevice::DrawGaussianBlur(RenderTarget* source, RenderTarget* tmp, Ren
       tech_v = SHADER_TECHNIQUE_fb_blur_vert39x39;
    }
 
-   RenderPass* const initial_rt = GetCurrentPass();
+   const RenderPass* initial_rt = GetCurrentPass();
    RenderState initial_state;
    CopyRenderStates(true, initial_state);
    ResetRenderState();
@@ -2114,28 +1963,27 @@ void RenderDevice::DrawGaussianBlur(RenderTarget* source, RenderTarget* tmp, Ren
    SetRenderState(RenderState::ZWRITEENABLE, RenderState::RS_FALSE);
    SetRenderState(RenderState::ZENABLE, RenderState::RS_FALSE);
    {
-      m_FBShader->SetTextureNull(SHADER_tex_fb_filtered);
+      FBShader->SetTextureNull(SHADER_tex_fb_filtered);
       SetRenderTarget(initial_rt->m_name + " HBlur", tmp, false); // switch to temporary output buffer for horizontal phase of gaussian blur
-      m_currentPass->m_singleLayerRendering = singleLayer; // We support blurring a single layer (for anaglyph defocusing)
+      m_currentPass->m_singleLayerRendering = singleLayer; // We support bluring a single layer (for anaglyph defocusing)
       AddRenderTargetDependency(source);
-      m_FBShader->SetTexture(SHADER_tex_fb_filtered, source->GetColorSampler());
-      m_FBShader->SetVector(SHADER_w_h_height, (float)(1.0 / source->GetWidth()), (float)(1.0 / source->GetHeight()), 1.0f, 1.0f);
-      m_FBShader->SetTechnique(tech_h);
-      DrawFullscreenTexturedQuad(m_FBShader);
+      FBShader->SetTexture(SHADER_tex_fb_filtered, source->GetColorSampler());
+      FBShader->SetVector(SHADER_w_h_height, (float)(1.0 / source->GetWidth()), (float)(1.0 / source->GetHeight()), 1.0f, 1.0f);
+      FBShader->SetTechnique(tech_h);
+      DrawFullscreenTexturedQuad(FBShader);
    }
    {
-      m_FBShader->SetTextureNull(SHADER_tex_fb_filtered);
+      FBShader->SetTextureNull(SHADER_tex_fb_filtered);
       SetRenderTarget(initial_rt->m_name + " VBlur", dest, false); // switch to output buffer for vertical phase of gaussian blur
-      m_currentPass->m_singleLayerRendering = singleLayer; // We support blurring a single layer (for anaglyph defocusing)
+      m_currentPass->m_singleLayerRendering = singleLayer; // We support bluring a single layer (for anaglyph defocusing)
       AddRenderTargetDependency(tmp);
-      m_FBShader->SetTexture(SHADER_tex_fb_filtered, tmp->GetColorSampler());
-      m_FBShader->SetVector(SHADER_w_h_height, (float)(1.0 / tmp->GetWidth()), (float)(1.0 / tmp->GetHeight()), 1.0f, 1.0f);
-      m_FBShader->SetTechnique(tech_v);
-      DrawFullscreenTexturedQuad(m_FBShader);
+      FBShader->SetTexture(SHADER_tex_fb_filtered, tmp->GetColorSampler());
+      FBShader->SetVector(SHADER_w_h_height, (float)(1.0 / tmp->GetWidth()), (float)(1.0 / tmp->GetHeight()), 1.0f, 1.0f);
+      FBShader->SetTechnique(tech_v);
+      DrawFullscreenTexturedQuad(FBShader);
    }
    CopyRenderStates(false, initial_state);
-   SetRenderTarget(initial_rt->m_name, initial_rt->m_rt, true);
-   initial_rt->m_name += '-';
+   SetRenderTarget(initial_rt->m_name + '+', initial_rt->m_rt, true);
 }
 
 void RenderDevice::SetMainTextureDefaultFiltering(const SamplerFilter filter)
@@ -2146,3 +1994,322 @@ void RenderDevice::SetMainTextureDefaultFiltering(const SamplerFilter filter)
    Shader::SetDefaultSamplerFilter(SHADER_tex_base_color, filter);
    Shader::SetDefaultSamplerFilter(SHADER_tex_base_normalmap, filter);
 }
+
+#ifdef ENABLE_SDL
+static ViewPort viewPort;
+#endif
+
+void RenderDevice::SetViewport(const ViewPort* p1)
+{
+#ifdef ENABLE_SDL
+   memcpy(&viewPort, p1, sizeof(ViewPort));
+#else
+   CHECKD3D(m_pD3DDevice->SetViewport((D3DVIEWPORT9*)p1));
+#endif
+}
+
+void RenderDevice::GetViewport(ViewPort* p1)
+{
+#ifdef ENABLE_SDL
+   memcpy(p1, &viewPort, sizeof(ViewPort));
+#else
+   CHECKD3D(m_pD3DDevice->GetViewport((D3DVIEWPORT9*)p1));
+#endif
+}
+
+//////////////////////////////////////////////////////////////////
+// VR device implementation
+
+void RenderDevice::SaveVRSettings(Settings& settings) const
+{
+   #ifdef ENABLE_VR
+   settings.SaveValue(Settings::PlayerVR, "Slope"s, m_slope);
+   settings.SaveValue(Settings::PlayerVR, "Orientation"s, m_orientation);
+   settings.SaveValue(Settings::PlayerVR, "TableX"s, m_tablex);
+   settings.SaveValue(Settings::PlayerVR, "TableY"s, m_tabley);
+   settings.SaveValue(Settings::PlayerVR, "TableZ"s, m_tablez);
+   #endif
+}
+
+#ifdef ENABLE_VR
+bool RenderDevice::isVRinstalled()
+{
+#ifdef VR_PREVIEW_TEST
+   return true;
+#else
+   return vr::VR_IsRuntimeInstalled();
+#endif
+}
+
+vr::IVRSystem* RenderDevice::m_pHMD = nullptr;
+
+bool RenderDevice::isVRturnedOn()
+{
+#ifdef VR_PREVIEW_TEST
+   return true;
+#else
+   if (vr::VR_IsHmdPresent())
+   {
+      vr::EVRInitError VRError = vr::VRInitError_None;
+      if (!m_pHMD)
+         m_pHMD = vr::VR_Init(&VRError, vr::VRApplication_Background);
+      if (VRError == vr::VRInitError_None && vr::VRCompositor()) {
+         for (uint32_t device = 0; device < vr::k_unMaxTrackedDeviceCount; device++) {
+            if ((m_pHMD->GetTrackedDeviceClass(device) == vr::TrackedDeviceClass_HMD)) {
+               vr::VR_Shutdown();
+               m_pHMD = nullptr;
+               return true;
+            }
+         }
+      } else
+         m_pHMD = nullptr;
+   }
+#endif
+   return false;
+}
+
+void RenderDevice::turnVROff()
+{
+   if (m_pHMD)
+   {
+      vr::VR_Shutdown();
+      m_pHMD = nullptr;
+   }
+}
+
+void RenderDevice::InitVR() {
+#ifdef VR_PREVIEW_TEST
+   m_pHMD = nullptr;
+#else
+   vr::EVRInitError VRError = vr::VRInitError_None;
+   if (!m_pHMD) {
+      m_pHMD = vr::VR_Init(&VRError, vr::VRApplication_Scene);
+      if (VRError != vr::VRInitError_None) {
+         m_pHMD = nullptr;
+         char buf[1024];
+         sprintf_s(buf, sizeof(buf), "Unable to init VR runtime: %s", vr::VR_GetVRInitErrorAsEnglishDescription(VRError));
+         ShowError(buf);
+      }
+      else if (!vr::VRCompositor())
+      /*if (VRError != vr::VRInitError_None)*/ {
+         m_pHMD = nullptr;
+         char buf[1024];
+         sprintf_s(buf, sizeof(buf), "Unable to init VR compositor");// :% s", vr::VR_GetVRInitErrorAsEnglishDescription(VRError));
+         ShowError(buf);
+      }
+   }
+#endif
+
+   // Move from VP units to meters, and also apply user scene scaling if any
+   Matrix3D sceneScale = Matrix3D::MatrixScale(m_scale);
+
+   // Convert from VPX coords to VR (270deg rotation around X axis, and flip x axis)
+   Matrix3D coords;
+   coords.SetIdentity();
+   coords._11 = -1.f; coords._12 = 0.f; coords._13 =  0.f;
+   coords._21 =  0.f; coords._22 = 0.f; coords._23 = -1.f;
+   coords._31 =  0.f; coords._32 = 1.f; coords._33 =  0.f;
+
+   float zNear, zFar;
+   g_pplayer->m_ptable->ComputeNearFarPlane(coords * sceneScale, m_scale, zNear, zFar);
+   zNear = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "NearPlane"s, 5.0f) / 100.0f; // Replace near value to allow player to move near parts up to user defined value
+   zFar *= 1.2f;
+
+   if (m_pHMD == nullptr)
+   {
+      // Basic debug setup (All OpenVR matrices are left handed, using meter units)
+      // For debugging without a headset, the null driver of OpenVR should be enabled. To do so:
+      // - Set "enable": true in default.vrsettings from C:\Program Files (x86)\Steam\steamapps\common\SteamVR\drivers\null\resources\settings
+      // - Add "activateMultipleDrivers" : true, "forcedDriver" : "null", to "steamvr" section of steamvr.vrsettings from C :\Program Files(x86)\Steam\config
+      uint32_t eye_width = 1080, eye_height = 1200; // Oculus Rift resolution
+      m_width = eye_width;
+      m_height = eye_height;
+      for (int i = 0; i < 2; i++)
+      {
+         Matrix3D proj;
+         proj.SetPerspectiveFovLH(90.f, 1.f, zNear, zFar);
+         m_vrMatProj[i] = coords * sceneScale * proj;
+      }
+   }
+   else
+   {
+      uint32_t eye_width, eye_height;
+      m_pHMD->GetRecommendedRenderTargetSize(&eye_width, &eye_height);
+      m_width = eye_width;
+      m_height = eye_height;
+      vr::HmdMatrix34_t left_eye_pos = m_pHMD->GetEyeToHeadTransform(vr::Eye_Left);
+      vr::HmdMatrix34_t right_eye_pos = m_pHMD->GetEyeToHeadTransform(vr::Eye_Right);
+      vr::HmdMatrix44_t left_eye_proj = m_pHMD->GetProjectionMatrix(vr::Eye_Left, zNear, zFar);
+      vr::HmdMatrix44_t right_eye_proj = m_pHMD->GetProjectionMatrix(vr::Eye_Right, zNear, zFar);
+
+      Matrix3D matEye2Head, matProjection;
+
+      //Calculate left EyeProjection Matrix relative to HMD position
+      matEye2Head.SetIdentity();
+      for (int i = 0; i < 3; i++)
+         for (int j = 0;j < 4;j++)
+            matEye2Head.m[j][i] = left_eye_pos.m[i][j];
+      matEye2Head.Invert();
+
+      left_eye_proj.m[2][2] = -1.0f;
+      left_eye_proj.m[2][3] = -zNear;
+      for (int i = 0;i < 4;i++)
+         for (int j = 0;j < 4;j++)
+            matProjection.m[j][i] = left_eye_proj.m[i][j];
+
+      m_vrMatProj[0] = coords * sceneScale * matEye2Head * matProjection;
+
+      //Calculate right EyeProjection Matrix relative to HMD position
+      matEye2Head.SetIdentity();
+      for (int i = 0; i < 3; i++)
+         for (int j = 0;j < 4;j++)
+            matEye2Head.m[j][i] = right_eye_pos.m[i][j];
+      matEye2Head.Invert();
+
+      right_eye_proj.m[2][2] = -1.0f;
+      right_eye_proj.m[2][3] = -zNear;
+      for (int i = 0;i < 4;i++)
+         for (int j = 0;j < 4;j++)
+            matProjection.m[j][i] = right_eye_proj.m[i][j];
+
+      m_vrMatProj[1] = coords * sceneScale * matEye2Head * matProjection;
+   }
+
+   if (vr::k_unMaxTrackedDeviceCount > 0) {
+      m_rTrackedDevicePose = new vr::TrackedDevicePose_t[vr::k_unMaxTrackedDeviceCount];
+   }
+   else {
+      std::runtime_error noDevicesFound("No Tracking devices found");
+      throw(noDevicesFound);
+   }
+
+   m_slope = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "Slope"s, 6.5f);
+   m_orientation = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "Orientation"s, 0.0f);
+   m_tablex = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "TableX"s, 0.0f);
+   m_tabley = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "TableY"s, 0.0f);
+   m_tablez = g_pplayer->m_ptable->m_settings.LoadValueWithDefault(Settings::PlayerVR, "TableZ"s, 80.0f);
+
+   updateTableMatrix();
+}
+
+void RenderDevice::UpdateVRPosition(ModelViewProj& mvp)
+{
+   mvp.SetProj(0, m_vrMatProj[0]);
+   mvp.SetProj(1, m_vrMatProj[1]);
+
+   Matrix3D matView;
+   matView.SetIdentity();
+
+   if (IsVRReady())
+   {
+      vr::VRCompositor()->WaitGetPoses(m_rTrackedDevicePose, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+      for (unsigned int device = 0; device < vr::k_unMaxTrackedDeviceCount; device++)
+      {
+         if ((m_rTrackedDevicePose[device].bPoseIsValid) && (m_pHMD->GetTrackedDeviceClass(device) == vr::TrackedDeviceClass_HMD))
+         {
+            m_hmdPosition = m_rTrackedDevicePose[device];
+
+            // Convert to 4x4 inverse matrix (world to head)
+            for (int i = 0; i < 3; i++)
+               for (int j = 0; j < 4; j++)
+                  matView.m[j][i] = m_hmdPosition.mDeviceToAbsoluteTracking.m[i][j];
+            matView.Invert();
+
+            // Scale translation part
+            for (int i = 0; i < 3; i++)
+               matView.m[3][i] /= m_scale;
+
+            // Convert from VPX coords to VR and back (270deg rotation around X axis, and flip x axis)
+            Matrix3D coords, revCoords;
+            coords.SetIdentity();
+            coords._11 = -1.f; coords._12 = 0.f; coords._13 =  0.f;
+            coords._21 =  0.f; coords._22 = 0.f; coords._23 = -1.f;
+            coords._31 =  0.f; coords._32 = 1.f; coords._33 =  0.f;
+            revCoords.SetIdentity();
+            revCoords._11 = -1.f; revCoords._12 =  0.f; revCoords._13 = 0.f;
+            revCoords._21 =  0.f; revCoords._22 =  0.f; revCoords._23 = 1.f;
+            revCoords._31 =  0.f; revCoords._32 = -1.f; revCoords._33 = 0.f;
+            matView = coords * matView * revCoords;
+
+            break;
+         }
+      }
+   }
+
+   // Apply table world position
+   mvp.SetView(m_tableWorld * matView);
+}
+
+void RenderDevice::tableUp()
+{
+   m_tablez += 1.0f;
+   if (m_tablez > 250.0f)
+      m_tablez = 250.0f;
+   updateTableMatrix();
+}
+
+void RenderDevice::tableDown()
+{
+   m_tablez -= 1.0f;
+   if (m_tablez < 0.0f)
+      m_tablez = 0.0f;
+   updateTableMatrix();
+}
+void RenderDevice::tableForward()
+{
+   m_tabley -= 1.0f;
+   updateTableMatrix();
+}
+void RenderDevice::tableBack()
+{
+   m_tabley += 1.0f;
+   updateTableMatrix();
+}
+void RenderDevice::tableRight()
+{
+   m_tablex -= 1.0f;
+   updateTableMatrix();
+}
+void RenderDevice::tableLeft()
+{
+   m_tablex += 1.0f;
+   updateTableMatrix();
+}
+
+void RenderDevice::recenterTable()
+{
+   const float w = m_scale * (g_pplayer->m_ptable->m_right - g_pplayer->m_ptable->m_left) * 0.5f;
+   const float h = m_scale * (g_pplayer->m_ptable->m_bottom - g_pplayer->m_ptable->m_top) + 0.2f;
+   float headX = 0.f, headY = 0.f;
+   if (IsVRReady())
+   {
+      m_orientation = -RADTOANG(atan2f(m_hmdPosition.mDeviceToAbsoluteTracking.m[0][2], m_hmdPosition.mDeviceToAbsoluteTracking.m[0][0]));
+      if (m_orientation < 0.0f)
+         m_orientation += 360.0f;
+      headX = m_hmdPosition.mDeviceToAbsoluteTracking.m[0][3];
+      headY = -m_hmdPosition.mDeviceToAbsoluteTracking.m[2][3];
+   }
+   const float c = cosf(ANGTORAD(m_orientation));
+   const float s = sinf(ANGTORAD(m_orientation));
+   m_tablex = 100.0f * (headX - c * w + s * h);
+   m_tabley = 100.0f * (headY + s * w + c * h);
+   updateTableMatrix();
+}
+
+void RenderDevice::updateTableMatrix()
+{
+   Matrix3D rotx, rotz, trans, coords;
+
+   // Tilt playfield.
+   rotx.SetRotateX(ANGTORAD(-m_slope));
+
+   // Rotate table around VR height axis
+   rotz.SetRotateZ(ANGTORAD(180.f + m_orientation));
+   
+   // Locate front left corner of the table in the room -x is to the right, -y is up and -z is back - all units in meters
+   const float inv_transScale = 1.0f / (100.0f * m_scale);
+   trans.SetTranslation(-m_tablex * inv_transScale, m_tabley * inv_transScale, m_tablez * inv_transScale);
+
+   m_tableWorld = rotx * rotz * trans;
+}
+#endif
