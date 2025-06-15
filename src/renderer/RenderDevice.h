@@ -196,6 +196,11 @@ public:
    void tableUp();
    void tableDown();
    void recenterTable();
+   void tableForward();
+   void tableBack();
+   void tableRight();
+   void tableLeft();
+   void updateTableMatrix(float x, float y, float z);
    void updateTableMatrix();
    static bool isVRinstalled();
    static bool isVRturnedOn();

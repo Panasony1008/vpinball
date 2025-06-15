@@ -3042,6 +3042,9 @@ void Player::UpdatePhysics()
       m_tableVelDelta = m_tableVel - m_tableVelOld;
       m_tableVelOld = m_tableVel;
 
+      int m_AnalogNudgGainX = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "AnalogNudgeGainX"s, 100);
+      int m_AnalogNudgGainY = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "AnalogNudgeGainY"s, 100);
+
       // apply the external accelerometer-based nudge velocity input (which is
       // a separate input from the traditional acceleration input)
       m_tableVelDelta += m_accelVel - m_accelVelOld;
@@ -3062,18 +3065,60 @@ void Player::UpdatePhysics()
               m_Nudge.x =  m_legacyNudgeBack.x;
               m_Nudge.y = -m_legacyNudgeBack.y;
           }
-
+#ifdef ENABLE_VR
           if (m_NudgeShake > 0.0f)
-              SetScreenOffset(m_NudgeShake * m_legacyNudgeBack.x * sqrf((float)m_legacyNudgeTime*0.01f), -m_NudgeShake * m_legacyNudgeBack.y * sqrf((float)m_legacyNudgeTime*0.01f));
+          {
+             if (m_stereo3D == STEREO_VR)
+             {
+                if (GetNudgeX() != 0 || GetNudgeY() != 0)
+                {
+                   m_pin3d.m_pd3dPrimaryDevice->updateTableMatrix(m_NudgeShake * m_AnalogNudgGainX * GetNudgeX(), m_NudgeShake * -m_AnalogNudgGainY * GetNudgeY(), 0);
+                }
+                else
+                {
+                   m_pin3d.m_pd3dPrimaryDevice->updateTableMatrix(m_NudgeShake * m_legacyNudgeBack.x * 100 * sqrf((float)m_legacyNudgeTime * 0.01f),
+                      -m_NudgeShake * m_legacyNudgeBack.y * 100 * sqrf((float)m_legacyNudgeTime * 0.01f), 0);
+                }
+             }
+             else
+             {
+                SetScreenOffset(m_NudgeShake * m_legacyNudgeBack.x * sqrf((float)m_legacyNudgeTime * 0.01f), -m_NudgeShake * m_legacyNudgeBack.y * sqrf((float)m_legacyNudgeTime * 0.01f));
+             }
+          }
       }
       else
           if (m_NudgeShake > 0.0f)
           {
               // NB: in table coordinates, +Y points down, but in screen coordinates, it points up,
               // so we have to flip the y component
-              SetScreenOffset(m_NudgeShake * m_tableDisplacement.x, -m_NudgeShake * m_tableDisplacement.y);
+              if (m_stereo3D == STEREO_VR)
+              {
+                 if (GetNudgeX() != 0 || GetNudgeY() != 0)
+                 {
+                    m_pin3d.m_pd3dPrimaryDevice->updateTableMatrix(m_NudgeShake * m_AnalogNudgGainX * GetNudgeX(), m_NudgeShake * -m_AnalogNudgGainY * GetNudgeY(), 0);
+                 }
+                 else
+                 {
+                    m_pin3d.m_pd3dPrimaryDevice->updateTableMatrix(m_NudgeShake * m_tableDisplacement.x * 100, -m_NudgeShake * m_tableDisplacement.y * 100, 0);
+                 }
+              }
+              else
+              {
+                 SetScreenOffset(m_NudgeShake * m_tableDisplacement.x, -m_NudgeShake * m_tableDisplacement.y);
+              }
           }
-
+#endif
+#ifndef ENABLE_VR
+          if (m_NudgeShake > 0.0f)
+             SetScreenOffset(m_NudgeShake * m_legacyNudgeBack.x * sqrf((float)m_legacyNudgeTime * 0.01f), -m_NudgeShake * m_legacyNudgeBack.y * sqrf((float)m_legacyNudgeTime * 0.01f));
+   }
+   else if (m_NudgeShake > 0.0f)
+   {
+      // NB: in table coordinates, +Y points down, but in screen coordinates, it points up,
+      // so we have to flip the y component
+      SetScreenOffset(m_NudgeShake * m_tableDisplacement.x, -m_NudgeShake * m_tableDisplacement.y);
+   }
+#endif
       // Apply our filter to the nudge data
       if (m_pininput.m_enable_nudge_filter)
          FilterNudge();

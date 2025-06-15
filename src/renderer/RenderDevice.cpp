@@ -2255,7 +2255,36 @@ void RenderDevice::tableDown()
       m_tablez = 0.0f;
    updateTableMatrix();
 }
-
+void RenderDevice::tableForward()
+{
+   m_tabley -= 1.0f;
+   updateTableMatrix();
+}
+void RenderDevice::tableBack()
+{
+   m_tabley += 1.0f;
+   updateTableMatrix();
+}
+void RenderDevice::tableRight()
+{
+   m_tablex -= 1.0f;
+   updateTableMatrix();
+}
+void RenderDevice::tableLeft()
+{
+   m_tablex += 1.0f;
+   updateTableMatrix();
+}
+void RenderDevice::updateTableMatrix(float x, float y, float z)
+{
+   m_tablex += x;
+   m_tabley += y;
+   m_tablez += z;
+   updateTableMatrix();
+   m_tablex -= x;
+   m_tabley -= y;
+   m_tablez -= z;
+}
 void RenderDevice::recenterTable()
 {
    const float w = m_scale * (g_pplayer->m_ptable->m_right - g_pplayer->m_ptable->m_left) * 0.5f;
