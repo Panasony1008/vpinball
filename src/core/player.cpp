@@ -1461,9 +1461,9 @@ HRESULT Player::Init()
    //   u'' = -k u - c u'
    // with a spring constant k and a damping coefficient c.
    // See http://en.wikipedia.org/wiki/Damping#Linear_damping
-
-   const float nudgeTime = m_ptable->m_nudgeTime;      // T
-   constexpr float dampingRatio = 0.5f;                // zeta
+   float nudgeTime = m_ptable->m_settings.LoadValueWithDefault(Settings::Player, "NudgeTime"s, m_ptable->m_nudgeTime);
+   if (nudgeTime == 0) nudgeTime = m_ptable->m_nudgeTime;
+   constexpr float dampingRatio = 0.5f; // zeta
 
    // time for one half period (one swing and swing back):
    //   T = pi / omega_d,
