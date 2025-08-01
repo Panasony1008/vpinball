@@ -56,11 +56,15 @@ STDMETHODIMP ScriptGlobalTable::EndModal()
 
 STDMETHODIMP ScriptGlobalTable::Nudge(float Angle, float Force)
 {
+   float m_Force = g_pvp->m_settings.LoadValueWithDefault(Settings::Player, "DigitalNudge"s, Force);
+   if (m_Force != 0)
+      Force = m_Force; 
    if (g_pplayer && (!g_pplayer->m_legacyNudge || g_pplayer->m_legacyNudgeTime == 0))
    {
       const float a  = ANGTORAD(Angle);
       const float sn = sinf(a) * Force;
       const float cs = cosf(a) * Force;
+      ;
 
       if (g_pplayer->m_legacyNudge)
       {
